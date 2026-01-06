@@ -528,6 +528,128 @@ def traction_control(S, accel):
             accel -= 0.1
     return max(0.0, accel)
 
+# ================= LAP TIME EXTRACTION SYSTEM =================
+class LapTimeTracker:
+    """
+    Tracks lap times using multiple methods:
+    1. curLapTime from server (if available)
+    2. distFromStart crossing detection (primary method)
+
+    Usage:
+        tracker = LapTimeTracker()
+        for step in simulation:
+            tracker.update(client.S.d)
+            if tracker.lap_just_completed:
+                print(f"Lap {tracker.lap_count}: {tracker.last_lap_time:.3f}s")
+    """
+
+    def __init__(self, track_length=None):
+        self.track_length = track_length  # Optional: set if known
+        self.lap_count = 0
+        self.last_lap_time = None
+        self.best_lap_time = None
+        self.lap_times = []
+        self.lap_just_completed = False
+
+        # Internal tracking state
+        self._prev_dist_from_start = None
+        self._prev_cur_lap_time = None
+        self._lap_start_time = None
+        self._total_time = 0.0
+        self._step_count = 0
+        self._STEP_DURATION = 0.02  # 50 steps per second = 0.02s per step
+
+    def update(self, server_state):
+        """
+        Update tracker with current server state.
+        Call this every simulation step.
+
+        Args:
+            server_state: Dictionary from ServerState.d containing sensor data
+
+        Returns:
+            bool: True if a lap was just completed
+        """
+        self.lap_just_completed = False
+        self._step_count += 1
+        self._total_time = self._step_count * self._STEP_DURATION
+
+        # Get current values
+        dist_from_start = server_state.get('distFromStart', 0)
+        cur_lap_time = server_state.get('curLapTime', None)
+        dist_raced = server_state.get('distRaced', 0)
+
+        # Method 1: Use curLapTime if available (most accurate)
+        if cur_lap_time is not None and self._prev_cur_lap_time is not None:
+            # Detect lap completion: curLapTime resets to near 0
+            if self._prev_cur_lap_time > 10 and cur_lap_time < 5:
+                self._record_lap(self._prev_cur_lap_time)
+
+        # Method 2: Detect distFromStart crossing (backup method)
+        if self._prev_dist_from_start is not None:
+            # Detect when car crosses start/finish line
+            # distFromStart jumps from high value to low value
+            if self._prev_dist_from_start > 100 and dist_from_start < 50:
+                # Only use this method if curLapTime didn't trigger
+                if not self.lap_just_completed and self._lap_start_time is not None:
+                    elapsed = self._total_time - self._lap_start_time
+                    if elapsed > 5:  # Sanity check: lap should take > 5 seconds
+                        self._record_lap(elapsed)
+                self._lap_start_time = self._total_time
+
+        # Initialize lap start time on first update
+        if self._lap_start_time is None:
+            self._lap_start_time = self._total_time
+
+        # Store previous values
+        self._prev_dist_from_start = dist_from_start
+        self._prev_cur_lap_time = cur_lap_time
+
+        return self.lap_just_completed
+
+    def _record_lap(self, lap_time):
+        """Record a completed lap."""
+        self.lap_count += 1
+        self.last_lap_time = lap_time
+        self.lap_times.append(lap_time)
+        self.lap_just_completed = True
+
+        if self.best_lap_time is None or lap_time < self.best_lap_time:
+            self.best_lap_time = lap_time
+
+    def get_stats(self):
+        """Get lap time statistics."""
+        if not self.lap_times:
+            return {
+                'lap_count': 0,
+                'last_lap': None,
+                'best_lap': None,
+                'avg_lap': None,
+                'all_laps': []
+            }
+
+        return {
+            'lap_count': self.lap_count,
+            'last_lap': self.last_lap_time,
+            'best_lap': self.best_lap_time,
+            'avg_lap': sum(self.lap_times) / len(self.lap_times),
+            'all_laps': self.lap_times.copy()
+        }
+
+    def reset(self):
+        """Reset tracker for a new episode."""
+        self.lap_count = 0
+        self.last_lap_time = None
+        self.best_lap_time = None
+        self.lap_times = []
+        self.lap_just_completed = False
+        self._prev_dist_from_start = None
+        self._prev_cur_lap_time = None
+        self._lap_start_time = None
+        self._total_time = 0.0
+        self._step_count = 0
+
+
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
     S, R = c.S.d, c.R.d
@@ -541,8 +663,37 @@ def drive_modular(c):
 # ================= MAIN LOOP =================
 if __name__ == "__main__":
     C = Client(p=3001)
+    lap_tracker = LapTimeTracker()
+
+    print("Starting simulation with lap time tracking...")
+    print("-" * 50)
+
     for step in range(C.maxSteps, 0, -1):
         C.get_servers_input()
-        drive_modular(C)
+        if C.S.d:  # Only process if we have valid server state
+            drive_modular(C)
+
+            # Update lap tracker
+            lap_tracker.update(C.S.d)
+
+            # Report lap completions
+            if lap_tracker.lap_just_completed:
+                stats = lap_tracker.get_stats()
+                print(f"Lap {lap_tracker.lap_count} completed: {lap_tracker.last_lap_time:.3f}s")
+                print(f"  Best: {stats['best_lap']:.3f}s | Avg: {stats['avg_lap']:.3f}s")
+
         C.respond_to_server()
+
+    # Final summary
+    print("-" * 50)
+    print("Simulation complete.")
+    stats = lap_tracker.get_stats()
+    if stats['lap_count'] > 0:
+        print(f"Total laps: {stats['lap_count']}")
+        print(f"Best lap time: {stats['best_lap']:.3f}s")
+        print(f"Average lap time: {stats['avg_lap']:.3f}s")
+        print(f"All lap times: {[f'{t:.3f}' for t in stats['all_laps']]}")
+    else:
+        print("No complete laps recorded.")
+
     C.shutdown()

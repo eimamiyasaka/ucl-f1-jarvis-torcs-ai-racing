@@ -1,0 +1,345 @@
+"""
+Stage 1: Baseline Runner
+Provides run_episode(params) -> lap_time functionality for parameter optimization.
+"""
+
+import sys
+import os
+import csv
+from datetime import datetime
+
+# Import from torcs_jm_par
+from torcs_jm_par import (
+    Client, LapTimeTracker,
+    calculate_steering, calculate_throttle, apply_brakes,
+    shift_gears, traction_control
+)
+import torcs_jm_par as torcs_module
+
+
+def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True):
+    """
+    Run a single episode with given parameters and return lap time.
+
+    Args:
+        params: dict with keys:
+            - TARGET_SPEED: float (10-300)
+            - STEER_GAIN: float (1-100)
+            - CENTERING_GAIN: float (0-2)
+            - BRAKE_THRESHOLD: float (0-1.5)
+            - GEAR_SPEEDS: list of 6 floats (ascending)
+            - ENABLE_TRACTION_CONTROL: bool
+        port: TORCS server port (default 3001)
+        max_steps: Maximum simulation steps (default 100000)
+        target_laps: Number of laps to complete before stopping (default 1)
+        verbose: Print progress info (default True)
+
+    Returns:
+        dict with:
+            - lap_time: Best lap time (None if no laps completed)
+            - lap_times: List of all lap times
+            - lap_count: Number of laps completed
+            - avg_lap_time: Average lap time (None if no laps)
+            - total_steps: Steps used
+            - completed: True if target_laps reached
+    """
+    # Apply parameters to module
+    torcs_module.TARGET_SPEED = params.get('TARGET_SPEED', 180)
+    torcs_module.STEER_GAIN = params.get('STEER_GAIN', 50)
+    torcs_module.CENTERING_GAIN = params.get('CENTERING_GAIN', 0.60)
+    torcs_module.BRAKE_THRESHOLD = params.get('BRAKE_THRESHOLD', 0.5)
+    torcs_module.GEAR_SPEEDS = params.get('GEAR_SPEEDS', [0, 50, 80, 120, 150, 200])
+    torcs_module.ENABLE_TRACTION_CONTROL = params.get('ENABLE_TRACTION_CONTROL', True)
+
+    if verbose:
+        print(f"Running episode with params:")
+        print(f"  TARGET_SPEED={torcs_module.TARGET_SPEED}")
+        print(f"  STEER_GAIN={torcs_module.STEER_GAIN}")
+        print(f"  CENTERING_GAIN={torcs_module.CENTERING_GAIN}")
+        print(f"  BRAKE_THRESHOLD={torcs_module.BRAKE_THRESHOLD}")
+        print(f"  GEAR_SPEEDS={torcs_module.GEAR_SPEEDS}")
+        print(f"  ENABLE_TRACTION_CONTROL={torcs_module.ENABLE_TRACTION_CONTROL}")
+
+    # Initialize client and tracker
+    C = Client(p=port)
+    C.maxSteps = max_steps
+    tracker = LapTimeTracker()
+
+    steps_used = 0
+
+    try:
+        for step in range(max_steps, 0, -1):
+            C.get_servers_input()
+            if C.so is None:  # Connection closed
+                break
+
+            if C.S.d:
+                # Drive using module functions (which use updated params)
+                S, R = C.S.d, C.R.d
+                R['steer'] = calculate_steering(S)
+                R['accel'] = calculate_throttle(S, R)
+                R['brake'] = apply_brakes(S)
+                R['accel'] = traction_control(S, R['accel'])
+                R['gear'] = shift_gears(S)
+
+                # Track lap times
+                tracker.update(C.S.d)
+
+                if tracker.lap_just_completed and verbose:
+                    print(f"  Lap {tracker.lap_count}: {tracker.last_lap_time:.3f}s")
+
+                # Stop if we've completed target laps
+                if tracker.lap_count >= target_laps:
+                    steps_used = max_steps - step
+                    break
+
+            C.respond_to_server()
+            steps_used = max_steps - step
+
+    finally:
+        C.shutdown()
+
+    # Build result
+    stats = tracker.get_stats()
+    result = {
+        'lap_time': stats['best_lap'],
+        'lap_times': stats['all_laps'],
+        'lap_count': stats['lap_count'],
+        'avg_lap_time': stats['avg_lap'],
+        'total_steps': steps_used,
+        'completed': stats['lap_count'] >= target_laps
+    }
+
+    if verbose:
+        print(f"Episode complete: {stats['lap_count']} laps, best={stats['best_lap']}")
+
+    return result
+
+
+def get_default_params():
+    """Return default parameter dictionary."""
+    return {
+        'TARGET_SPEED': 180,
+        'STEER_GAIN': 50,
+        'CENTERING_GAIN': 0.60,
+        'BRAKE_THRESHOLD': 0.5,
+        'GEAR_SPEEDS': [0, 50, 80, 120, 150, 200],
+        'ENABLE_TRACTION_CONTROL': True
+    }
+
+
+# ================= CSV LOGGING =================
+class ResultLogger:
+    """
+    Logs episode results to CSV file.
+
+    CSV columns:
+        timestamp, target_speed, steer_gain, centering_gain, brake_threshold,
+        gear_1, gear_2, gear_3, gear_4, gear_5, gear_6, traction_control,
+        lap_time, avg_lap_time, lap_count, completed
+    """
+
+    def __init__(self, filepath='results/run_log.csv'):
+        self.filepath = filepath
+        self._ensure_dir()
+        self._write_header()
+
+    def _ensure_dir(self):
+        """Create results directory if it doesn't exist."""
+        dir_path = os.path.dirname(self.filepath)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+
+    def _write_header(self):
+        """Write CSV header if file doesn't exist."""
+        if not os.path.exists(self.filepath):
+            with open(self.filepath, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'timestamp',
+                    'target_speed', 'steer_gain', 'centering_gain', 'brake_threshold',
+                    'gear_1', 'gear_2', 'gear_3', 'gear_4', 'gear_5', 'gear_6',
+                    'traction_control',
+                    'lap_time', 'avg_lap_time', 'lap_count', 'completed'
+                ])
+
+    def log(self, params, result):
+        """
+        Log a single episode result.
+
+        Args:
+            params: Parameter dictionary
+            result: Result dictionary from run_episode()
+        """
+        gear_speeds = params.get('GEAR_SPEEDS', [0, 50, 80, 120, 150, 200])
+
+        row = [
+            datetime.now().isoformat(),
+            params.get('TARGET_SPEED', 180),
+            params.get('STEER_GAIN', 50),
+            params.get('CENTERING_GAIN', 0.60),
+            params.get('BRAKE_THRESHOLD', 0.5),
+            gear_speeds[0], gear_speeds[1], gear_speeds[2],
+            gear_speeds[3], gear_speeds[4], gear_speeds[5],
+            1 if params.get('ENABLE_TRACTION_CONTROL', True) else 0,
+            result.get('lap_time', ''),
+            result.get('avg_lap_time', ''),
+            result.get('lap_count', 0),
+            1 if result.get('completed', False) else 0
+        ]
+
+        with open(self.filepath, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+
+def run_episode_logged(params, logger=None, **kwargs):
+    """
+    Run episode and log results to CSV.
+
+    Args:
+        params: Parameter dictionary
+        logger: ResultLogger instance (creates default if None)
+        **kwargs: Additional args passed to run_episode()
+
+    Returns:
+        Result dictionary from run_episode()
+    """
+    if logger is None:
+        logger = ResultLogger()
+
+    result = run_episode(params, **kwargs)
+    logger.log(params, result)
+
+    return result
+
+
+# ================= PARAMETER SWEEP =================
+def run_parameter_sweep(sweep_config=None, target_laps=1, verbose=True):
+    """
+    Run a manual parameter sweep to validate the system.
+
+    Args:
+        sweep_config: dict mapping param names to lists of values to try.
+                     If None, uses a default sweep configuration.
+        target_laps: Number of laps per episode
+        verbose: Print progress
+
+    Returns:
+        List of (params, result) tuples sorted by lap_time (best first)
+    """
+    if sweep_config is None:
+        # Default sweep: test a few values for key parameters
+        sweep_config = {
+            'TARGET_SPEED': [150, 180, 210],
+            'STEER_GAIN': [40, 50, 60],
+            'CENTERING_GAIN': [0.5, 0.6, 0.7],
+        }
+
+    # Generate all parameter combinations
+    from itertools import product
+
+    base_params = get_default_params()
+    param_names = list(sweep_config.keys())
+    param_values = [sweep_config[k] for k in param_names]
+
+    combinations = list(product(*param_values))
+    total_runs = len(combinations)
+
+    if verbose:
+        print("=" * 60)
+        print("PARAMETER SWEEP")
+        print("=" * 60)
+        print(f"Sweeping: {param_names}")
+        print(f"Total combinations: {total_runs}")
+        print("=" * 60)
+
+    logger = ResultLogger('results/sweep_log.csv')
+    results = []
+
+    for i, combo in enumerate(combinations):
+        # Build params for this run
+        params = base_params.copy()
+        for name, value in zip(param_names, combo):
+            params[name] = value
+
+        if verbose:
+            print(f"\n[{i+1}/{total_runs}] Testing: ", end="")
+            print(", ".join(f"{n}={v}" for n, v in zip(param_names, combo)))
+
+        result = run_episode_logged(params, logger=logger, target_laps=target_laps, verbose=False)
+        results.append((params.copy(), result))
+
+        if verbose:
+            if result['lap_time']:
+                print(f"  -> Lap time: {result['lap_time']:.3f}s")
+            else:
+                print(f"  -> No lap completed")
+
+    # Sort by lap time (best first), putting None values at end
+    results.sort(key=lambda x: x[1]['lap_time'] if x[1]['lap_time'] else float('inf'))
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("SWEEP RESULTS (sorted by lap time)")
+        print("=" * 60)
+        for i, (params, result) in enumerate(results[:10]):  # Show top 10
+            lap_time = result['lap_time']
+            if lap_time:
+                print(f"{i+1}. {lap_time:.3f}s - ", end="")
+                print(", ".join(f"{n}={params[n]}" for n in param_names))
+            else:
+                print(f"{i+1}. DNF - ", end="")
+                print(", ".join(f"{n}={params[n]}" for n in param_names))
+
+        print(f"\nResults saved to: {logger.filepath}")
+
+    return results
+
+
+def run_quick_sweep(verbose=True):
+    """
+    Run a quick 3x3 sweep on TARGET_SPEED and STEER_GAIN only.
+    Good for quick validation.
+    """
+    sweep_config = {
+        'TARGET_SPEED': [160, 180, 200],
+        'STEER_GAIN': [45, 50, 55],
+    }
+    return run_parameter_sweep(sweep_config, target_laps=1, verbose=verbose)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='TORCS Baseline Runner')
+    parser.add_argument('--sweep', action='store_true', help='Run full parameter sweep (27 runs)')
+    parser.add_argument('--quick-sweep', action='store_true', help='Run quick parameter sweep (9 runs)')
+    parser.add_argument('--laps', type=int, default=1, help='Target laps per episode')
+    args = parser.parse_args()
+
+    if args.sweep:
+        # Full sweep: 3x3x3 = 27 combinations
+        run_parameter_sweep(target_laps=args.laps)
+    elif args.quick_sweep:
+        # Quick sweep: 3x3 = 9 combinations
+        run_quick_sweep()
+    else:
+        # Single test run with default parameters
+        print("=" * 50)
+        print("Baseline Runner - Single Test")
+        print("=" * 50)
+        print("Use --sweep or --quick-sweep for parameter sweep")
+        print("=" * 50)
+
+        params = get_default_params()
+        logger = ResultLogger()
+
+        result = run_episode_logged(params, logger=logger, target_laps=args.laps, verbose=True)
+
+        print("\n" + "=" * 50)
+        print("Results:")
+        print(f"  Lap time: {result['lap_time']}")
+        print(f"  Completed: {result['completed']}")
+        print(f"  Steps used: {result['total_steps']}")
+        print(f"  Results logged to: {logger.filepath}")
