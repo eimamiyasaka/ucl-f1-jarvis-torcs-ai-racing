@@ -119,10 +119,10 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
 def get_default_params():
     """Return default parameter dictionary."""
     return {
-        'TARGET_SPEED': 180,
-        'STEER_GAIN': 50,
+        'TARGET_SPEED': 70,
+        'STEER_GAIN': 18,
         'CENTERING_GAIN': 0.60,
-        'BRAKE_THRESHOLD': 0.5,
+        'BRAKE_THRESHOLD': 0.2,
         'GEAR_SPEEDS': [0, 50, 80, 120, 150, 200],
         'ENABLE_TRACTION_CONTROL': True
     }
