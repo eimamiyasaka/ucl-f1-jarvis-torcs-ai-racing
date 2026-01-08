@@ -16,6 +16,21 @@ from torcs_jm_par import (
 )
 import torcs_jm_par as torcs_module
 
+# Base gear speeds (scaled by GEAR_SHIFT_SCALE)
+BASE_GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]
+
+
+def gear_shift_scale_to_speeds(scale):
+    """Convert GEAR_SHIFT_SCALE to actual gear speeds list."""
+    return [BASE_GEAR_SPEEDS[0]] + [BASE_GEAR_SPEEDS[i] * scale for i in range(1, 6)]
+
+
+def speeds_to_gear_shift_scale(speeds):
+    """Estimate GEAR_SHIFT_SCALE from gear speeds (uses gear 2 as reference)."""
+    if BASE_GEAR_SPEEDS[2] > 0 and len(speeds) > 2:
+        return speeds[2] / BASE_GEAR_SPEEDS[2]
+    return 1.0
+
 
 def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True):
     """
@@ -27,7 +42,8 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
             - STEER_GAIN: float (1-100)
             - CENTERING_GAIN: float (0-2)
             - BRAKE_THRESHOLD: float (0-1.5)
-            - GEAR_SPEEDS: list of 6 floats (ascending)
+            - GEAR_SHIFT_SCALE: float (0.5-1.5) - scales base gear speeds
+              OR GEAR_SPEEDS: list of 6 floats (for backward compatibility)
             - ENABLE_TRACTION_CONTROL: bool
         port: TORCS server port (default 3001)
         max_steps: Maximum simulation steps (default 100000)
@@ -48,7 +64,15 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
     torcs_module.STEER_GAIN = params.get('STEER_GAIN', 50)
     torcs_module.CENTERING_GAIN = params.get('CENTERING_GAIN', 0.60)
     torcs_module.BRAKE_THRESHOLD = params.get('BRAKE_THRESHOLD', 0.5)
-    torcs_module.GEAR_SPEEDS = params.get('GEAR_SPEEDS', [0, 50, 80, 120, 150, 200])
+
+    # Handle gear speeds: prefer GEAR_SHIFT_SCALE, fall back to GEAR_SPEEDS
+    if 'GEAR_SHIFT_SCALE' in params:
+        gear_scale = params['GEAR_SHIFT_SCALE']
+        torcs_module.GEAR_SPEEDS = gear_shift_scale_to_speeds(gear_scale)
+    else:
+        torcs_module.GEAR_SPEEDS = params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
+        gear_scale = speeds_to_gear_shift_scale(torcs_module.GEAR_SPEEDS)
+
     torcs_module.ENABLE_TRACTION_CONTROL = params.get('ENABLE_TRACTION_CONTROL', True)
 
     if verbose:
@@ -57,7 +81,7 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
         print(f"  STEER_GAIN={torcs_module.STEER_GAIN}")
         print(f"  CENTERING_GAIN={torcs_module.CENTERING_GAIN}")
         print(f"  BRAKE_THRESHOLD={torcs_module.BRAKE_THRESHOLD}")
-        print(f"  GEAR_SPEEDS={torcs_module.GEAR_SPEEDS}")
+        print(f"  GEAR_SHIFT_SCALE={gear_scale:.2f} -> {torcs_module.GEAR_SPEEDS}")
         print(f"  ENABLE_TRACTION_CONTROL={torcs_module.ENABLE_TRACTION_CONTROL}")
 
     # Initialize client and tracker
@@ -123,7 +147,7 @@ def get_default_params():
         'STEER_GAIN': 18,
         'CENTERING_GAIN': 0.60,
         'BRAKE_THRESHOLD': 0.2,
-        'GEAR_SPEEDS': [0, 50, 80, 120, 150, 200],
+        'GEAR_SHIFT_SCALE': 1.0,  # 1.0 = default gear speeds
         'ENABLE_TRACTION_CONTROL': True
     }
 
@@ -135,7 +159,7 @@ class ResultLogger:
 
     CSV columns:
         timestamp, target_speed, steer_gain, centering_gain, brake_threshold,
-        gear_1, gear_2, gear_3, gear_4, gear_5, gear_6, traction_control,
+        gear_shift_scale, traction_control,
         lap_time, avg_lap_time, lap_count, completed
     """
 
@@ -158,8 +182,7 @@ class ResultLogger:
                 writer.writerow([
                     'timestamp',
                     'target_speed', 'steer_gain', 'centering_gain', 'brake_threshold',
-                    'gear_1', 'gear_2', 'gear_3', 'gear_4', 'gear_5', 'gear_6',
-                    'traction_control',
+                    'gear_shift_scale', 'traction_control',
                     'lap_time', 'avg_lap_time', 'lap_count', 'completed'
                 ])
 
@@ -171,7 +194,12 @@ class ResultLogger:
             params: Parameter dictionary
             result: Result dictionary from run_episode()
         """
-        gear_speeds = params.get('GEAR_SPEEDS', [0, 50, 80, 120, 150, 200])
+        # Get gear_shift_scale (compute from GEAR_SPEEDS if not present)
+        if 'GEAR_SHIFT_SCALE' in params:
+            gear_scale = params['GEAR_SHIFT_SCALE']
+        else:
+            gear_speeds = params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
+            gear_scale = speeds_to_gear_shift_scale(gear_speeds)
 
         row = [
             datetime.now().isoformat(),
@@ -179,8 +207,7 @@ class ResultLogger:
             params.get('STEER_GAIN', 50),
             params.get('CENTERING_GAIN', 0.60),
             params.get('BRAKE_THRESHOLD', 0.5),
-            gear_speeds[0], gear_speeds[1], gear_speeds[2],
-            gear_speeds[3], gear_speeds[4], gear_speeds[5],
+            gear_scale,
             1 if params.get('ENABLE_TRACTION_CONTROL', True) else 0,
             result.get('lap_time', ''),
             result.get('avg_lap_time', ''),
@@ -233,7 +260,7 @@ def run_parameter_sweep(sweep_config=None, target_laps=1, verbose=True):
         sweep_config = {
             'TARGET_SPEED': [150, 180, 210],
             'STEER_GAIN': [40, 50, 60],
-            'CENTERING_GAIN': [0.5, 0.6, 0.7],
+            'GEAR_SHIFT_SCALE': [0.8, 1.0, 1.2],
         }
 
     # Generate all parameter combinations

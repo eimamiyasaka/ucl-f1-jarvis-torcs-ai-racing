@@ -20,58 +20,60 @@ PARAM_BOUNDS = {
     'STEER_GAIN': (1, 100),
     'CENTERING_GAIN': (0, 2),
     'BRAKE_THRESHOLD': (0, 1.5),
-    'GEAR_0': (0, 50),
-    'GEAR_1': (20, 80),
-    'GEAR_2': (50, 120),
-    'GEAR_3': (80, 160),
-    'GEAR_4': (100, 200),
-    'GEAR_5': (150, 250),
+    'GEAR_SHIFT_SCALE': (0.5, 1.5),  # Scales default gear speeds (1.0 = default)
     'TRACTION_CONTROL': (0, 1),
 }
 
 # Gene indices for chromosome
 GENE_NAMES = [
     'TARGET_SPEED', 'STEER_GAIN', 'CENTERING_GAIN', 'BRAKE_THRESHOLD',
-    'GEAR_0', 'GEAR_1', 'GEAR_2', 'GEAR_3', 'GEAR_4', 'GEAR_5',
-    'TRACTION_CONTROL'
+    'GEAR_SHIFT_SCALE', 'TRACTION_CONTROL'
 ]
+
+# Base gear speeds (will be scaled by GEAR_SHIFT_SCALE)
+BASE_GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]
 
 DNF_PENALTY = 999  # Penalty time for crashes/incomplete laps
 
 
 # ================= CHROMOSOME CONVERSION =================
 def params_to_chromosome(params):
-    """Convert parameter dict to chromosome (11-element list)."""
-    gear_speeds = params.get('GEAR_SPEEDS', [0, 50, 80, 120, 150, 200])
+    """Convert parameter dict to chromosome (6-element list)."""
     tc = 1 if params.get('ENABLE_TRACTION_CONTROL', True) else 0
+
+    # Estimate gear shift scale from current gear speeds
+    gear_speeds = params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
+    # Use ratio of gear 2 to estimate scale (avoiding gear 0 which is always 0)
+    if BASE_GEAR_SPEEDS[2] > 0:
+        gear_scale = gear_speeds[2] / BASE_GEAR_SPEEDS[2]
+    else:
+        gear_scale = 1.0
 
     return [
         params.get('TARGET_SPEED', 70),
         params.get('STEER_GAIN', 18),
         params.get('CENTERING_GAIN', 0.6),
         params.get('BRAKE_THRESHOLD', 0.2),
-        gear_speeds[0],
-        gear_speeds[1],
-        gear_speeds[2],
-        gear_speeds[3],
-        gear_speeds[4],
-        gear_speeds[5],
+        gear_scale,
         tc
     ]
 
 
 def chromosome_to_params(chromosome):
-    """Convert chromosome (11-element list) to parameter dict."""
+    """Convert chromosome (6-element list) to parameter dict."""
+    gear_scale = chromosome[4]
+    # Scale base gear speeds, keeping gear 0 at 0
+    scaled_gears = [BASE_GEAR_SPEEDS[0]]  # First gear threshold stays at 0
+    for i in range(1, len(BASE_GEAR_SPEEDS)):
+        scaled_gears.append(BASE_GEAR_SPEEDS[i] * gear_scale)
+
     return {
         'TARGET_SPEED': chromosome[0],
         'STEER_GAIN': chromosome[1],
         'CENTERING_GAIN': chromosome[2],
         'BRAKE_THRESHOLD': chromosome[3],
-        'GEAR_SPEEDS': [
-            chromosome[4], chromosome[5], chromosome[6],
-            chromosome[7], chromosome[8], chromosome[9]
-        ],
-        'ENABLE_TRACTION_CONTROL': chromosome[10] >= 0.5
+        'GEAR_SPEEDS': scaled_gears,
+        'ENABLE_TRACTION_CONTROL': chromosome[5] >= 0.5
     }
 
 
@@ -89,8 +91,7 @@ def random_chromosome():
 def repair_chromosome(chromosome):
     """
     Repair chromosome to satisfy constraints:
-    1. Clip all values to bounds
-    2. Sort gear speeds in ascending order
+    - Clip all values to bounds
     """
     repaired = chromosome.copy()
 
@@ -98,11 +99,6 @@ def repair_chromosome(chromosome):
     for i, gene_name in enumerate(GENE_NAMES):
         low, high = PARAM_BOUNDS[gene_name]
         repaired[i] = max(low, min(high, repaired[i]))
-
-    # Sort gear speeds (indices 4-9)
-    gear_speeds = repaired[4:10]
-    gear_speeds_sorted = sorted(gear_speeds)
-    repaired[4:10] = gear_speeds_sorted
 
     return repaired
 
