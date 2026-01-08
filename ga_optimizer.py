@@ -41,13 +41,17 @@ def params_to_chromosome(params):
     """Convert parameter dict to chromosome (6-element list)."""
     tc = 1 if params.get('ENABLE_TRACTION_CONTROL', True) else 0
 
-    # Estimate gear shift scale from current gear speeds
-    gear_speeds = params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
-    # Use ratio of gear 2 to estimate scale (avoiding gear 0 which is always 0)
-    if BASE_GEAR_SPEEDS[2] > 0:
-        gear_scale = gear_speeds[2] / BASE_GEAR_SPEEDS[2]
+    # Get gear shift scale: prefer direct value, fall back to computing from GEAR_SPEEDS
+    if 'GEAR_SHIFT_SCALE' in params:
+        gear_scale = params['GEAR_SHIFT_SCALE']
     else:
-        gear_scale = 1.0
+        # Estimate gear shift scale from current gear speeds
+        gear_speeds = params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
+        # Use ratio of gear 2 to estimate scale (avoiding gear 0 which is always 0)
+        if BASE_GEAR_SPEEDS[2] > 0:
+            gear_scale = gear_speeds[2] / BASE_GEAR_SPEEDS[2]
+        else:
+            gear_scale = 1.0
 
     return [
         params.get('TARGET_SPEED', 70),
