@@ -93,6 +93,9 @@ class Client():
         self.so.settimeout(1)
 
         n_fail = 5
+        max_restart_attempts = 3
+        restart_attempts = 0
+
         while True:
             a= "-45 -19 -12 -7 -4 -2.5 -1.7 -1 -.5 0 .5 1 1.7 2.5 4 7 12 19 45"
 
@@ -110,16 +113,40 @@ class Client():
                 print("Waiting for server on %d............" % self.port)
                 print("Count Down : " + str(n_fail))
                 if n_fail < 0:
-                    print("relaunch torcs")
-                    os.system('pkill torcs')
-                    time.sleep(1.0)
-                    if self.vision is False:
-                        os.system('torcs -nofuel -nodamage -nolaptime &')
-                    else:
-                        os.system('torcs -nofuel -nodamage -nolaptime -vision &')
+                    restart_attempts += 1
+                    if restart_attempts > max_restart_attempts:
+                        print("\n" + "="*50)
+                        print("ERROR: Could not connect to TORCS server.")
+                        print("Please manually start TORCS and begin a race with scr_server driver.")
+                        print("="*50)
+                        raise ConnectionError("TORCS server not available after %d restart attempts" % max_restart_attempts)
 
-                    time.sleep(1.0)
-                    os.system('sh autostart.sh')
+                    print("Attempting to relaunch TORCS (attempt %d/%d)..." % (restart_attempts, max_restart_attempts))
+
+                    # Platform-specific restart
+                    if sys.platform == 'win32':
+                        os.system('taskkill /IM wtorcs.exe /F 2>nul')
+                        time.sleep(1.0)
+                        # Try to start TORCS - user may need to manually start the race
+                        torcs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'torcs', 'wtorcs.exe')
+                        if os.path.exists(torcs_path):
+                            os.startfile(torcs_path)
+                            print("Started TORCS. Please start a Quick Race with scr_server driver.")
+                        else:
+                            print("Could not find wtorcs.exe at: %s" % torcs_path)
+                            print("Please start TORCS manually and begin a race.")
+                    else:
+                        os.system('pkill torcs')
+                        time.sleep(1.0)
+                        if self.vision is False:
+                            os.system('torcs -nofuel -nodamage -nolaptime &')
+                        else:
+                            os.system('torcs -nofuel -nodamage -nolaptime -vision &')
+                        time.sleep(1.0)
+                        if os.path.exists('autostart.sh'):
+                            os.system('sh autostart.sh')
+
+                    time.sleep(3.0)  # Give TORCS time to start
                     n_fail = 5
                 n_fail -= 1
 
