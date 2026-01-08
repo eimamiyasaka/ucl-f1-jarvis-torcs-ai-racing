@@ -318,6 +318,9 @@ if __name__ == "__main__":
     parser.add_argument('--laps', type=int, default=1, help='Target laps per episode')
     args = parser.parse_args()
 
+    # Clear sys.argv so torcs_jm_par's Client doesn't try to parse our arguments
+    sys.argv = [sys.argv[0]]
+
     if args.sweep:
         # Full sweep: 3x3x3 = 27 combinations
         run_parameter_sweep(target_laps=args.laps)
