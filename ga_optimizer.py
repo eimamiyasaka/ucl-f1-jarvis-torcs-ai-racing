@@ -171,6 +171,11 @@ def evaluate_fitness(chromosome, verbose=False):
     try:
         result = run_episode(params, target_laps=1, verbose=verbose)
 
+        if result.get('dnf'):
+            if verbose:
+                print(f"  DNF: {result.get('dnf_reason', 'unknown')}")
+            return -DNF_PENALTY
+
         if result['lap_time'] is None:
             return -DNF_PENALTY
 

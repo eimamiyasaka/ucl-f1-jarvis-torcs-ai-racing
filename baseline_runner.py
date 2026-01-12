@@ -6,6 +6,7 @@ Provides run_episode(params) -> lap_time functionality for parameter optimizatio
 import sys
 import os
 import csv
+import math
 from datetime import datetime
 
 # Import from torcs_jm_par
@@ -18,6 +19,11 @@ import torcs_jm_par as torcs_module
 
 # Base gear speeds (scaled by GEAR_SHIFT_SCALE)
 BASE_GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]
+
+# DNF detection threshold: |trackPos| > this value = too far off track
+# trackPos: 0 = center, +/-1 = track edge, >1 = off track
+# Set > 1.0 to allow some off-track driving (e.g., 1.3 = 30% past edge)
+DEFAULT_OFF_TRACK_THRESHOLD = 1.3
 
 
 def gear_shift_scale_to_speeds(scale):
@@ -32,7 +38,8 @@ def speeds_to_gear_shift_scale(speeds):
     return 1.0
 
 
-def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True):
+def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True,
+                 off_track_threshold=None):
     """
     Run a single episode with given parameters and return lap time.
 
@@ -49,16 +56,23 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
         max_steps: Maximum simulation steps (default 100000)
         target_laps: Number of laps to complete before stopping (default 1)
         verbose: Print progress info (default True)
+        off_track_threshold: Max |trackPos| before DNF (default 1.3, None to disable)
+                            trackPos: 0=center, +/-1=edge, >1=off track
 
     Returns:
         dict with:
-            - lap_time: Best lap time (None if no laps completed)
+            - lap_time: Best lap time (None if no laps completed or DNF)
             - lap_times: List of all lap times
             - lap_count: Number of laps completed
             - avg_lap_time: Average lap time (None if no laps)
             - total_steps: Steps used
             - completed: True if target_laps reached
+            - dnf: True if episode ended due to DNF condition
+            - dnf_reason: String describing DNF cause (None if not DNF)
     """
+    # Set default off-track threshold
+    if off_track_threshold is None:
+        off_track_threshold = DEFAULT_OFF_TRACK_THRESHOLD
     # Apply parameters to module
     torcs_module.TARGET_SPEED = params.get('TARGET_SPEED', 180)
     torcs_module.STEER_GAIN = params.get('STEER_GAIN', 50)
@@ -90,6 +104,8 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
     tracker = LapTimeTracker()
 
     steps_used = 0
+    dnf = False
+    dnf_reason = None
 
     try:
         for step in range(max_steps, 0, -1):
@@ -100,6 +116,27 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
             if C.S.d:
                 # Drive using module functions (which use updated params)
                 S, R = C.S.d, C.R.d
+
+                # DNF check: car too far off track
+                track_pos = S.get('trackPos', 0)
+                if off_track_threshold and abs(track_pos) > off_track_threshold:
+                    dnf = True
+                    dnf_reason = f"off-track (trackPos={track_pos:.2f}, threshold={off_track_threshold})"
+                    if verbose:
+                        print(f"  DNF: {dnf_reason}")
+                    steps_used = max_steps - step
+                    break
+
+                # DNF check: car facing backward (angle > 90 degrees from track direction)
+                angle = S.get('angle', 0)
+                if math.cos(angle) < 0:
+                    dnf = True
+                    dnf_reason = f"facing backward (angle={math.degrees(angle):.1f}°)"
+                    if verbose:
+                        print(f"  DNF: {dnf_reason}")
+                    steps_used = max_steps - step
+                    break
+
                 R['steer'] = calculate_steering(S)
                 R['accel'] = calculate_throttle(S, R)
                 R['brake'] = apply_brakes(S)
@@ -126,16 +163,21 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
     # Build result
     stats = tracker.get_stats()
     result = {
-        'lap_time': stats['best_lap'],
+        'lap_time': None if dnf else stats['best_lap'],  # DNF = no valid lap time
         'lap_times': stats['all_laps'],
         'lap_count': stats['lap_count'],
         'avg_lap_time': stats['avg_lap'],
         'total_steps': steps_used,
-        'completed': stats['lap_count'] >= target_laps
+        'completed': stats['lap_count'] >= target_laps and not dnf,
+        'dnf': dnf,
+        'dnf_reason': dnf_reason
     }
 
     if verbose:
-        print(f"Episode complete: {stats['lap_count']} laps, best={stats['best_lap']}")
+        if dnf:
+            print(f"Episode DNF: {dnf_reason}")
+        else:
+            print(f"Episode complete: {stats['lap_count']} laps, best={stats['best_lap']}")
 
     return result
 
@@ -143,10 +185,10 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
 def get_default_params():
     """Return default parameter dictionary."""
     return {
-        'TARGET_SPEED': 70,
-        'STEER_GAIN': 18,
-        'CENTERING_GAIN': 0.60,
-        'BRAKE_THRESHOLD': 0.2,
+        'TARGET_SPEED': 120,
+        'STEER_GAIN': 20,
+        'CENTERING_GAIN': 0.80,
+        'BRAKE_THRESHOLD': 0.1,
         'GEAR_SHIFT_SCALE': 1.0,  # 1.0 = default gear speeds
         'ENABLE_TRACTION_CONTROL': True
     }
