@@ -286,7 +286,8 @@ def run_ga(
     elite_count=3,
     tournament_size=3,
     seed=None,
-    verbose=True
+    verbose=True,
+    stagnation_limit=10
 ):
     """
     Run the Genetic Algorithm optimization.
@@ -300,6 +301,7 @@ def run_ga(
         tournament_size: Tournament selection size (default 3)
         seed: Random seed for reproducibility
         verbose: Print progress (default True)
+        stagnation_limit: Stop early if no improvement for this many generations (default 10, 0 to disable)
 
     Returns:
         dict with:
@@ -308,6 +310,7 @@ def run_ga(
             - best_params: Best parameters as dict
             - best_lap_time: Best lap time in seconds
             - generations_run: Number of generations completed
+            - converged: True if stopped due to convergence
     """
     if seed is not None:
         random.seed(seed)
@@ -320,11 +323,12 @@ def run_ga(
         print("GENETIC ALGORITHM OPTIMIZER")
         print("=" * 60)
         print(f"Population size: {population_size}")
-        print(f"Generations: {generations}")
+        print(f"Generations: {generations} (max)")
         print(f"Mutation rate: {mutation_rate}")
         print(f"Crossover rate: {crossover_rate}")
         print(f"Elite count: {elite_count}")
         print(f"Tournament size: {tournament_size}")
+        print(f"Stagnation limit: {stagnation_limit} generations" if stagnation_limit > 0 else "Stagnation limit: disabled")
         print("=" * 60)
 
     # Initialize population
@@ -339,9 +343,13 @@ def run_ga(
 
     best_ever_chromosome = None
     best_ever_fitness = float('-inf')
+    generations_without_improvement = 0
+    converged = False
+    actual_generations = 0
 
     # Main GA loop
     for gen in range(generations):
+        actual_generations = gen + 1
         if verbose:
             print(f"\n--- Generation {gen + 1}/{generations} ---")
 
@@ -354,11 +362,17 @@ def run_ga(
 
             # Only restart if there are more evaluations to come
             is_final_evaluation = is_final_generation and (i == population_size - 1)
-            fitness = evaluate_fitness(chromosome, verbose=False, restart=not is_final_evaluation)
+            fitness = evaluate_fitness(
+                chromosome,
+                verbose=False,
+                restart=not is_final_evaluation
+            )
             fitnesses.append(fitness)
 
             if verbose:
                 lap_time = -fitness if fitness > -DNF_PENALTY else "DNF"
+                if isinstance(lap_time, float):
+                    lap_time = f"{lap_time:.3f}s"
                 print(f"Fitness: {fitness:.2f} (Lap: {lap_time})")
 
         # Find best in this generation
@@ -366,18 +380,36 @@ def run_ga(
         gen_best_fitness = fitnesses[gen_best_idx]
         gen_best_chromosome = population[gen_best_idx]
 
-        # Track best ever
+        # Track best ever and convergence
+        improved = False
         if gen_best_fitness > best_ever_fitness:
             best_ever_fitness = gen_best_fitness
             best_ever_chromosome = gen_best_chromosome.copy()
+            generations_without_improvement = 0
+            improved = True
+        else:
+            generations_without_improvement += 1
 
         # Log generation
         logger.log_generation(gen + 1, fitnesses, gen_best_chromosome)
 
         if verbose:
             best_time = -gen_best_fitness if gen_best_fitness > -DNF_PENALTY else "DNF"
+            if isinstance(best_time, float):
+                best_time = f"{best_time:.3f}s"
             avg_fitness = sum(fitnesses) / len(fitnesses)
-            print(f"  Gen {gen + 1} Best: {best_time}, Avg fitness: {avg_fitness:.2f}")
+            best_ever_time = -best_ever_fitness if best_ever_fitness > -DNF_PENALTY else "DNF"
+            if isinstance(best_ever_time, float):
+                best_ever_time = f"{best_ever_time:.3f}s"
+            status = "NEW BEST!" if improved else f"(stagnant: {generations_without_improvement}/{stagnation_limit})"
+            print(f"  Gen {gen + 1} Best: {best_time}, Best ever: {best_ever_time} {status}")
+
+        # Check for convergence (early stopping)
+        if stagnation_limit > 0 and generations_without_improvement >= stagnation_limit:
+            converged = True
+            if verbose:
+                print(f"\n*** CONVERGED: No improvement for {stagnation_limit} generations ***")
+            break
 
         # Check if we're at last generation
         if gen == generations - 1:
@@ -422,7 +454,11 @@ def run_ga(
         print("\n" + "=" * 60)
         print("OPTIMIZATION COMPLETE")
         print("=" * 60)
-        print(f"Best lap time: {best_lap_time}s" if best_lap_time else "Best: DNF")
+        if converged:
+            print(f"Stopped early: converged after {actual_generations} generations")
+        else:
+            print(f"Completed all {actual_generations} generations")
+        print(f"Best lap time: {best_lap_time:.3f}s" if best_lap_time else "Best: DNF")
         print(f"Best parameters:")
         for key, value in best_params.items():
             print(f"  {key}: {value}")
@@ -434,7 +470,8 @@ def run_ga(
         'best_fitness': best_ever_fitness,
         'best_params': best_params,
         'best_lap_time': best_lap_time,
-        'generations_run': generations
+        'generations_run': actual_generations,
+        'converged': converged
     }
 
 
@@ -444,10 +481,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='TORCS GA Optimizer')
     parser.add_argument('--population', type=int, default=30, help='Population size (default: 30)')
-    parser.add_argument('--generations', type=int, default=50, help='Number of generations (default: 50)')
+    parser.add_argument('--generations', type=int, default=50, help='Max generations (default: 50)')
     parser.add_argument('--mutation-rate', type=float, default=0.15, help='Mutation rate (default: 0.15)')
     parser.add_argument('--crossover-rate', type=float, default=0.8, help='Crossover rate (default: 0.8)')
     parser.add_argument('--elite', type=int, default=3, help='Elite count (default: 3)')
+    parser.add_argument('--stagnation', type=int, default=10, help='Stop after N generations without improvement (default: 10, 0 to disable)')
     parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
     parser.add_argument('--quiet', action='store_true', help='Reduce output verbosity')
     args = parser.parse_args()
@@ -461,8 +499,11 @@ if __name__ == "__main__":
         mutation_rate=args.mutation_rate,
         crossover_rate=args.crossover_rate,
         elite_count=args.elite,
+        stagnation_limit=args.stagnation,
         seed=args.seed,
         verbose=not args.quiet
     )
 
-    print(f"\nBest lap time achieved: {result['best_lap_time']}s")
+    if result['converged']:
+        print(f"\nConverged after {result['generations_run']} generations")
+    print(f"Best lap time achieved: {result['best_lap_time']:.3f}s" if result['best_lap_time'] else "Best: DNF")
