@@ -16,7 +16,7 @@ from baseline_runner import run_episode, get_default_params, ResultLogger
 # ================= PARAMETER BOUNDS =================
 # [min, max] for each gene
 PARAM_BOUNDS = {
-    'TARGET_SPEED': (10, 300),
+    'TARGET_SPEED': (50, 300),
     'STEER_GAIN': (1, 100),
     'CENTERING_GAIN': (0, 2),
     'BRAKE_THRESHOLD': (0, 1.5),
