@@ -5,15 +5,6 @@ import getopt
 import os
 import time
 
-# Try to import pyautogui for Windows GUI automation
-try:
-    import pyautogui
-    PYAUTOGUI_AVAILABLE = True
-    pyautogui.FAILSAFE = True  # Move mouse to corner to abort
-    pyautogui.PAUSE = 0.1  # Small pause between actions
-except ImportError:
-    PYAUTOGUI_AVAILABLE = False
-
 PI= 3.14159265359
 
 data_size = 2**17
@@ -69,86 +60,6 @@ def bargraph(x,mn,mx,w,c='X'):
     ppc= int(pospu/upw)*c
     pnc= int(posnonpu/upw)*'_'
     return '[%s]' % (nnc+npc+ppc+pnc)
-
-
-def autostart_torcs_race_windows():
-    """
-    Automate TORCS GUI on Windows to start a Quick Race.
-    Uses pyautogui to click through: Race -> Quick Race -> New Race
-
-    Returns True if automation was attempted, False if pyautogui not available.
-    """
-    if not PYAUTOGUI_AVAILABLE:
-        print("pyautogui not available - please install with: pip install pyautogui")
-        return False
-
-    if sys.platform != 'win32':
-        return False
-
-    try:
-        import pygetwindow as gw
-        PYGETWINDOW_AVAILABLE = True
-    except ImportError:
-        PYGETWINDOW_AVAILABLE = False
-
-    print("Attempting GUI automation to start TORCS race...")
-
-    # Wait longer for TORCS to fully load (splash screen takes time)
-    time.sleep(3.0)
-
-    # Wait for TORCS window to appear
-    torcs_window = None
-    for attempt in range(20):
-        time.sleep(0.5)
-        if PYGETWINDOW_AVAILABLE:
-            windows = gw.getWindowsWithTitle('TORCS')
-            if windows:
-                torcs_window = windows[0]
-                print(f"  Found TORCS window: {torcs_window.title}")
-                break
-        else:
-            # Without pygetwindow, just wait and hope TORCS is focused
-            time.sleep(2.0)
-            break
-
-    if PYGETWINDOW_AVAILABLE and torcs_window:
-        # Activate and focus the TORCS window
-        try:
-            torcs_window.activate()
-            time.sleep(0.5)
-            # Click center of window to ensure focus
-            center_x = torcs_window.left + torcs_window.width // 2
-            center_y = torcs_window.top + torcs_window.height // 2
-            pyautogui.click(center_x, center_y)
-            time.sleep(0.3)
-        except Exception as e:
-            print(f"  Could not activate TORCS window: {e}")
-
-    time.sleep(1.0)  # Wait for TORCS to be ready after focus
-
-    # TORCS menu navigation: Race -> Quick Race -> New Race
-    # Use longer delays to ensure menus have time to respond
-
-    print("  Step 1: Selecting 'Race'...")
-    pyautogui.press('down')
-    pyautogui.press('enter')
-    time.sleep(1.0)
-
-    print("  Step 2: Selecting 'Quick Race'...")
-    pyautogui.press('enter')
-    time.sleep(1.0)
-
-    print("  Step 3: Selecting 'New Race'...")
-    pyautogui.press('enter')
-    time.sleep(1.0)
-
-    # May need additional Enter to confirm and start
-    print("  Step 4: Starting race...")
-    pyautogui.press('enter')
-    time.sleep(2.0)
-
-    print("GUI automation complete - waiting for TORCS server...")
-    return True
 
 
 class Client():
@@ -228,9 +139,7 @@ class Client():
                             os.startfile('wtorcs.exe')
                             os.chdir(original_dir)  # Restore original directory
                             time.sleep(2.0)  # Wait for TORCS to load
-                            # Try GUI automation to start the race
-                            if not autostart_torcs_race_windows():
-                                print("GUI automation failed. Please start a Quick Race manually.")
+                            print("Please start a Quick Race manually in TORCS.")
                         else:
                             print("Could not find wtorcs.exe at: %s" % torcs_exe)
                             print("Please start TORCS manually and begin a race.")
@@ -342,6 +251,23 @@ class Client():
         if not self.so: return
         print(("Race terminated or %d steps elapsed. Shutting down %d."
                % (self.maxSteps,self.port)))
+        self.so.close()
+        self.so = None
+
+    def restart_race(self):
+        """Request TORCS to restart the race via meta flag, then close connection.
+
+        This is faster than relaunching TORCS - the server resets the car position
+        and race state without restarting the process.
+        """
+        if not self.so: return
+        print("Requesting race restart on port %d..." % self.port)
+        self.R.d['meta'] = 1
+        try:
+            self.respond_to_server()
+            time.sleep(0.1)  # Brief pause for server to process
+        except:
+            pass  # Server may close connection immediately
         self.so.close()
         self.so = None
 
