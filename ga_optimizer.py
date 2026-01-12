@@ -160,16 +160,21 @@ def gaussian_mutate(chromosome, mutation_rate=0.15):
 
 
 # ================= FITNESS EVALUATION =================
-def evaluate_fitness(chromosome, verbose=False):
+def evaluate_fitness(chromosome, verbose=False, restart=True):
     """
     Evaluate fitness of a chromosome.
     Returns negative lap time (we maximize fitness, lower lap time is better).
     DNF returns -999.
+
+    Args:
+        chromosome: List of gene values
+        verbose: Print progress info
+        restart: If True, request race restart after evaluation. If False, just shutdown.
     """
     params = chromosome_to_params(chromosome)
 
     try:
-        result = run_episode(params, target_laps=1, verbose=verbose)
+        result = run_episode(params, target_laps=1, verbose=verbose, restart=restart)
 
         if result.get('dnf'):
             if verbose:
@@ -342,11 +347,14 @@ def run_ga(
 
         # Evaluate fitness for all individuals
         fitnesses = []
+        is_final_generation = (gen == generations - 1)
         for i, chromosome in enumerate(population):
             if verbose:
                 print(f"  Evaluating individual {i + 1}/{population_size}...", end=" ")
 
-            fitness = evaluate_fitness(chromosome, verbose=False)
+            # Only restart if there are more evaluations to come
+            is_final_evaluation = is_final_generation and (i == population_size - 1)
+            fitness = evaluate_fitness(chromosome, verbose=False, restart=not is_final_evaluation)
             fitnesses.append(fitness)
 
             if verbose:

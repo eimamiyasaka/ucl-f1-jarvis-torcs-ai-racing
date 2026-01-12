@@ -39,7 +39,7 @@ def speeds_to_gear_shift_scale(speeds):
 
 
 def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True,
-                 off_track_threshold=None):
+                 off_track_threshold=None, restart=True):
     """
     Run a single episode with given parameters and return lap time.
 
@@ -58,6 +58,7 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
         verbose: Print progress info (default True)
         off_track_threshold: Max |trackPos| before DNF (default 1.3, None to disable)
                             trackPos: 0=center, +/-1=edge, >1=off track
+        restart: If True, request race restart for next episode. If False, just shutdown (default True)
 
     Returns:
         dict with:
@@ -158,7 +159,10 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
             steps_used = max_steps - step
 
     finally:
-        C.shutdown()
+        if restart:
+            C.restart_race()  # Request TORCS to restart race for next episode
+        else:
+            C.shutdown()  # Final episode, just close connection
 
     # Build result
     stats = tracker.get_stats()
