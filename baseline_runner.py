@@ -25,6 +25,12 @@ BASE_GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]
 # Set > 1.0 to allow some off-track driving (e.g., 1.3 = 30% past edge)
 DEFAULT_OFF_TRACK_THRESHOLD = 1.3
 
+# DNF detection for stalled start: car must travel at least this distance
+# within the first N steps, otherwise it's considered stalled/stuck
+# TORCS runs at ~50Hz, so 250 steps ≈ 5 seconds
+DEFAULT_START_MIN_DISTANCE = 25  # meters
+DEFAULT_START_CHECK_STEPS = 250  # steps (~5 seconds at 50Hz)
+
 
 def gear_shift_scale_to_speeds(scale):
     """Convert GEAR_SHIFT_SCALE to actual gear speeds list."""
@@ -39,7 +45,8 @@ def speeds_to_gear_shift_scale(speeds):
 
 
 def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True,
-                 off_track_threshold=None, restart=True):
+                 off_track_threshold=None, restart=True,
+                 start_min_distance=None, start_check_steps=None):
     """
     Run a single episode with given parameters and return lap time.
 
@@ -59,6 +66,9 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
         off_track_threshold: Max |trackPos| before DNF (default 1.3, None to disable)
                             trackPos: 0=center, +/-1=edge, >1=off track
         restart: If True, request race restart for next episode. If False, just shutdown (default True)
+        start_min_distance: Minimum distance (m) car must travel within start_check_steps,
+                           otherwise DNF for stalled start (default 50m, None to disable)
+        start_check_steps: Number of steps to check start distance (default 250 = ~5 sec)
 
     Returns:
         dict with:
@@ -74,6 +84,13 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
     # Set default off-track threshold
     if off_track_threshold is None:
         off_track_threshold = DEFAULT_OFF_TRACK_THRESHOLD
+
+    # Set default start distance check parameters
+    if start_min_distance is None:
+        start_min_distance = DEFAULT_START_MIN_DISTANCE
+    if start_check_steps is None:
+        start_check_steps = DEFAULT_START_CHECK_STEPS
+
     # Apply parameters to module
     torcs_module.TARGET_SPEED = params.get('TARGET_SPEED', 180)
     torcs_module.STEER_GAIN = params.get('STEER_GAIN', 50)
@@ -107,6 +124,7 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
     steps_used = 0
     dnf = False
     dnf_reason = None
+    start_check_done = False  # Track if we've checked for stalled start
 
     try:
         for step in range(max_steps, 0, -1):
@@ -137,6 +155,19 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
                         print(f"  DNF: {dnf_reason}")
                     steps_used = max_steps - step
                     break
+
+                # DNF check: car stalled at start (hasn't moved enough distance)
+                current_step = max_steps - step
+                if start_min_distance and not start_check_done and current_step >= start_check_steps:
+                    dist_raced = S.get('distRaced', 0)
+                    if dist_raced < start_min_distance:
+                        dnf = True
+                        dnf_reason = f"stalled at start (distRaced={dist_raced:.1f}m after {start_check_steps} steps, need {start_min_distance}m)"
+                        if verbose:
+                            print(f"  DNF: {dnf_reason}")
+                        steps_used = current_step
+                        break
+                    start_check_done = True  # Passed the check, don't check again
 
                 R['steer'] = calculate_steering(S)
                 R['accel'] = calculate_throttle(S, R)
@@ -189,11 +220,11 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
 def get_default_params():
     """Return default parameter dictionary."""
     return {
-        'TARGET_SPEED': 60,
-        'STEER_GAIN': 20,
-        'CENTERING_GAIN': 0.80,
-        'BRAKE_THRESHOLD': 0.1,
-        'GEAR_SHIFT_SCALE': 1.0,  # 1.0 = default gear speeds
+        'TARGET_SPEED': 277.7441144954421,
+        'STEER_GAIN': 41.839620942212335,
+        'CENTERING_GAIN': 1.047190853697004,
+        'BRAKE_THRESHOLD': 0.02,
+        'GEAR_SHIFT_SCALE': 0.9758407264761297,  # 1.0 = default gear speeds
         'ENABLE_TRACTION_CONTROL': True
     }
 
