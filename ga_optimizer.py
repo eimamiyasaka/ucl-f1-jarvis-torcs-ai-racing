@@ -19,15 +19,14 @@ PARAM_BOUNDS = {
     'TARGET_SPEED': (50, 300),
     'STEER_GAIN': (1, 100),
     'CENTERING_GAIN': (0, 2),
-    'BRAKE_THRESHOLD': (0, 1.5),
+    'BRAKE_THRESHOLD': (0.02, 1.5),
     'GEAR_SHIFT_SCALE': (0.5, 1.5),  # Scales default gear speeds (1.0 = default)
-    'TRACTION_CONTROL': (0, 1),
 }
 
 # Gene indices for chromosome
 GENE_NAMES = [
     'TARGET_SPEED', 'STEER_GAIN', 'CENTERING_GAIN', 'BRAKE_THRESHOLD',
-    'GEAR_SHIFT_SCALE', 'TRACTION_CONTROL'
+    'GEAR_SHIFT_SCALE'
 ]
 
 # Base gear speeds (will be scaled by GEAR_SHIFT_SCALE)
@@ -38,9 +37,7 @@ DNF_PENALTY = 999  # Penalty time for crashes/incomplete laps
 
 # ================= CHROMOSOME CONVERSION =================
 def params_to_chromosome(params):
-    """Convert parameter dict to chromosome (6-element list)."""
-    tc = 1 if params.get('ENABLE_TRACTION_CONTROL', True) else 0
-
+    """Convert parameter dict to chromosome (5-element list)."""
     # Get gear shift scale: prefer direct value, fall back to computing from GEAR_SPEEDS
     if 'GEAR_SHIFT_SCALE' in params:
         gear_scale = params['GEAR_SHIFT_SCALE']
@@ -59,12 +56,11 @@ def params_to_chromosome(params):
         params.get('CENTERING_GAIN', 0.6),
         params.get('BRAKE_THRESHOLD', 0.2),
         gear_scale,
-        tc
     ]
 
 
 def chromosome_to_params(chromosome):
-    """Convert chromosome (6-element list) to parameter dict."""
+    """Convert chromosome (5-element list) to parameter dict."""
     gear_scale = chromosome[4]
     # Scale base gear speeds, keeping gear 0 at 0
     scaled_gears = [BASE_GEAR_SPEEDS[0]]  # First gear threshold stays at 0
@@ -77,7 +73,7 @@ def chromosome_to_params(chromosome):
         'CENTERING_GAIN': chromosome[2],
         'BRAKE_THRESHOLD': chromosome[3],
         'GEAR_SPEEDS': scaled_gears,
-        'ENABLE_TRACTION_CONTROL': chromosome[5] >= 0.5
+        'ENABLE_TRACTION_CONTROL': True  # Always enabled
     }
 
 
@@ -147,14 +143,9 @@ def gaussian_mutate(chromosome, mutation_rate=0.15):
     for i, gene_name in enumerate(GENE_NAMES):
         if random.random() < mutation_rate:
             low, high = PARAM_BOUNDS[gene_name]
-
-            if gene_name == 'TRACTION_CONTROL':
-                # Flip bit for boolean
-                mutated[i] = 1 - mutated[i]
-            else:
-                # Gaussian mutation with sigma = 10% of range
-                sigma = (high - low) * 0.1
-                mutated[i] += random.gauss(0, sigma)
+            # Gaussian mutation with sigma = 10% of range
+            sigma = (high - low) * 0.1
+            mutated[i] += random.gauss(0, sigma)
 
     return repair_chromosome(mutated)
 
