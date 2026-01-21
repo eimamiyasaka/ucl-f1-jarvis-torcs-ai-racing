@@ -543,6 +543,7 @@ def drive_example(c):
 import math
 
 # ================= USER CONFIGURABLE PARAMETERS =================
+# Core driving parameters
 TARGET_SPEED = 70  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
 STEER_GAIN = 18     # Steering sensitivity. Higher values make the car turn more aggressively.
 CENTERING_GAIN = 0.60  # How strongly the car corrects its position toward the center of the track.
@@ -550,22 +551,34 @@ BRAKE_THRESHOLD = 0.2  # Angle threshold for braking. Lower values brake earlier
 GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]  # Speed thresholds for gear shifting.
 ENABLE_TRACTION_CONTROL = True  # Toggle traction control system.
 
+# Throttle control parameters (NEW)
+THROTTLE_INCREASE = 0.4  # Acceleration rate when below target speed (0.2-0.8)
+THROTTLE_DECREASE = 0.2  # Deceleration rate when above target speed (0.1-0.5)
+SPEED_STEER_FACTOR = 2.5  # How much steering affects target speed reduction (1.0-5.0)
+
+# Brake control parameters (NEW)
+BRAKE_INTENSITY = 0.3  # Braking force when threshold exceeded (0.1-0.8)
+
+# Traction control parameters (NEW)
+TC_THRESHOLD = 2  # Wheel spin differential to trigger TC (1-10)
+TC_REDUCTION = 0.1  # Throttle reduction when TC activates (0.05-0.3)
+
 # ================= HELPER FUNCTIONS =================
 def calculate_steering(S):
     steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
     return max(-1, min(1, steer))
 
 def calculate_throttle(S, R):
-    if S['speedX'] < TARGET_SPEED - (R['steer'] * 2.5):
-        accel = min(1.0, R['accel'] + 0.4)
+    if S['speedX'] < TARGET_SPEED - (R['steer'] * SPEED_STEER_FACTOR):
+        accel = min(1.0, R['accel'] + THROTTLE_INCREASE)
     else:
-        accel = max(0.0, R['accel'] - 0.2)
+        accel = max(0.0, R['accel'] - THROTTLE_DECREASE)
     if S['speedX'] < 10:
         accel += 1 / (S['speedX'] + 0.1)
     return max(0.0, min(1.0, accel))
 
 def apply_brakes(S):
-    return 0.3 if abs(S['angle']) > BRAKE_THRESHOLD else 0.0
+    return BRAKE_INTENSITY if abs(S['angle']) > BRAKE_THRESHOLD else 0.0
 
 def shift_gears(S):
     gear = 1
@@ -576,8 +589,8 @@ def shift_gears(S):
 
 def traction_control(S, accel):
     if ENABLE_TRACTION_CONTROL:
-        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > 2:
-            accel -= 0.1
+        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > TC_THRESHOLD:
+            accel -= TC_REDUCTION
     return max(0.0, accel)
 
 # ================= LAP TIME EXTRACTION SYSTEM =================

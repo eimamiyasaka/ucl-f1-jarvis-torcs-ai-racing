@@ -14,66 +14,99 @@ from datetime import datetime
 from baseline_runner import run_episode, get_default_params, ResultLogger
 
 # ================= PARAMETER BOUNDS =================
-# [min, max] for each gene
+# [min, max] for each gene - 15 total chromosomes
 PARAM_BOUNDS = {
-    'TARGET_SPEED': (50, 300),
-    'STEER_GAIN': (1, 100),
-    'CENTERING_GAIN': (0, 2),
-    'BRAKE_THRESHOLD': (0.02, 1.5),
-    'GEAR_SHIFT_SCALE': (0.5, 1.5),  # Scales default gear speeds (1.0 = default)
+    # Core driving parameters (4)
+    'TARGET_SPEED': (50, 300),       # Target speed in km/h
+    'STEER_GAIN': (1, 100),          # Steering sensitivity
+    'CENTERING_GAIN': (0, 2),        # Track centering strength
+    'BRAKE_THRESHOLD': (0.02, 1.5),  # Angle threshold for braking (radians)
+    # Individual gear speed thresholds (5)
+    'GEAR_2_SPEED': (30, 80),        # Speed to shift to gear 2
+    'GEAR_3_SPEED': (60, 130),       # Speed to shift to gear 3
+    'GEAR_4_SPEED': (100, 180),      # Speed to shift to gear 4
+    'GEAR_5_SPEED': (140, 220),      # Speed to shift to gear 5
+    'GEAR_6_SPEED': (180, 280),      # Speed to shift to gear 6
+    # Throttle control parameters (3)
+    'THROTTLE_INCREASE': (0.2, 0.8), # Acceleration rate when below target
+    'THROTTLE_DECREASE': (0.1, 0.5), # Deceleration rate when above target
+    'SPEED_STEER_FACTOR': (1.0, 5.0),# How steering affects target speed reduction
+    # Brake control parameters (1)
+    'BRAKE_INTENSITY': (0.1, 0.8),   # Braking force when threshold exceeded
+    # Traction control parameters (2)
+    'TC_THRESHOLD': (1, 10),         # Wheel spin differential to trigger TC
+    'TC_REDUCTION': (0.05, 0.3),     # Throttle reduction when TC activates
 }
 
-# Gene indices for chromosome
+# Gene indices for chromosome (15 genes)
 GENE_NAMES = [
+    # Core (4)
     'TARGET_SPEED', 'STEER_GAIN', 'CENTERING_GAIN', 'BRAKE_THRESHOLD',
-    'GEAR_SHIFT_SCALE'
+    # Gears (5)
+    'GEAR_2_SPEED', 'GEAR_3_SPEED', 'GEAR_4_SPEED', 'GEAR_5_SPEED', 'GEAR_6_SPEED',
+    # Throttle (3)
+    'THROTTLE_INCREASE', 'THROTTLE_DECREASE', 'SPEED_STEER_FACTOR',
+    # Brake (1)
+    'BRAKE_INTENSITY',
+    # Traction control (2)
+    'TC_THRESHOLD', 'TC_REDUCTION',
 ]
-
-# Base gear speeds (will be scaled by GEAR_SHIFT_SCALE)
-BASE_GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]
 
 DNF_PENALTY = 999  # Penalty time for crashes/incomplete laps
 
 
 # ================= CHROMOSOME CONVERSION =================
 def params_to_chromosome(params):
-    """Convert parameter dict to chromosome (5-element list)."""
-    # Get gear shift scale: prefer direct value, fall back to computing from GEAR_SPEEDS
-    if 'GEAR_SHIFT_SCALE' in params:
-        gear_scale = params['GEAR_SHIFT_SCALE']
-    else:
-        # Estimate gear shift scale from current gear speeds
-        gear_speeds = params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
-        # Use ratio of gear 2 to estimate scale (avoiding gear 0 which is always 0)
-        if BASE_GEAR_SPEEDS[2] > 0:
-            gear_scale = gear_speeds[2] / BASE_GEAR_SPEEDS[2]
-        else:
-            gear_scale = 1.0
+    """Convert parameter dict to chromosome (15-element list)."""
+    # Extract gear speeds from GEAR_SPEEDS list if present
+    gear_speeds = params.get('GEAR_SPEEDS', [0, 50, 80, 120, 150, 200])
 
     return [
+        # Core (4)
         params.get('TARGET_SPEED', 70),
         params.get('STEER_GAIN', 18),
         params.get('CENTERING_GAIN', 0.6),
         params.get('BRAKE_THRESHOLD', 0.2),
-        gear_scale,
+        # Gears (5) - extract from GEAR_SPEEDS list (indices 1-5)
+        gear_speeds[1] if len(gear_speeds) > 1 else 50,
+        gear_speeds[2] if len(gear_speeds) > 2 else 80,
+        gear_speeds[3] if len(gear_speeds) > 3 else 120,
+        gear_speeds[4] if len(gear_speeds) > 4 else 150,
+        gear_speeds[5] if len(gear_speeds) > 5 else 200,
+        # Throttle (3)
+        params.get('THROTTLE_INCREASE', 0.4),
+        params.get('THROTTLE_DECREASE', 0.2),
+        params.get('SPEED_STEER_FACTOR', 2.5),
+        # Brake (1)
+        params.get('BRAKE_INTENSITY', 0.3),
+        # Traction control (2)
+        params.get('TC_THRESHOLD', 2.0),
+        params.get('TC_REDUCTION', 0.1),
     ]
 
 
 def chromosome_to_params(chromosome):
-    """Convert chromosome (5-element list) to parameter dict."""
-    gear_scale = chromosome[4]
-    # Scale base gear speeds, keeping gear 0 at 0
-    scaled_gears = [BASE_GEAR_SPEEDS[0]]  # First gear threshold stays at 0
-    for i in range(1, len(BASE_GEAR_SPEEDS)):
-        scaled_gears.append(BASE_GEAR_SPEEDS[i] * gear_scale)
-
+    """Convert chromosome (15-element list) to parameter dict."""
     return {
+        # Core (4)
         'TARGET_SPEED': chromosome[0],
         'STEER_GAIN': chromosome[1],
         'CENTERING_GAIN': chromosome[2],
         'BRAKE_THRESHOLD': chromosome[3],
-        'GEAR_SPEEDS': scaled_gears,
-        'ENABLE_TRACTION_CONTROL': True  # Always enabled
+        # Gear speeds as list (gear 0 is always 0)
+        'GEAR_SPEEDS': [0, chromosome[4], chromosome[5], chromosome[6],
+                        chromosome[7], chromosome[8]],
+        # Throttle (3)
+        'THROTTLE_INCREASE': chromosome[9],
+        'THROTTLE_DECREASE': chromosome[10],
+        'SPEED_STEER_FACTOR': chromosome[11],
+        # Brake (1)
+        'BRAKE_INTENSITY': chromosome[12],
+        # Traction control (2)
+        'TC_THRESHOLD': chromosome[13],
+        'TC_REDUCTION': chromosome[14],
+        # Fixed parameter
+        'ENABLE_TRACTION_CONTROL': True
     }
 
 
@@ -92,13 +125,26 @@ def repair_chromosome(chromosome):
     """
     Repair chromosome to satisfy constraints:
     - Clip all values to bounds
+    - Ensure gear speeds are in ascending order
     """
-    repaired = chromosome.copy()
+    repaired = list(chromosome)
 
     # Clip to bounds
     for i, gene_name in enumerate(GENE_NAMES):
         low, high = PARAM_BOUNDS[gene_name]
         repaired[i] = max(low, min(high, repaired[i]))
+
+    # Ensure gear speeds are in ascending order (indices 4-8)
+    # GEAR_2 < GEAR_3 < GEAR_4 < GEAR_5 < GEAR_6
+    gear_indices = [4, 5, 6, 7, 8]  # Indices for gear speeds in chromosome
+    for i in range(1, len(gear_indices)):
+        curr_idx = gear_indices[i]
+        prev_idx = gear_indices[i - 1]
+        # If current gear speed is not greater than previous, adjust it
+        if repaired[curr_idx] <= repaired[prev_idx]:
+            # Set to previous + small increment, but stay within bounds
+            low, high = PARAM_BOUNDS[GENE_NAMES[curr_idx]]
+            repaired[curr_idx] = min(high, repaired[prev_idx] + 10)
 
     return repaired
 
