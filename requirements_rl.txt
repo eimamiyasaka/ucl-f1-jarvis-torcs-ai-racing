@@ -1,0 +1,21 @@
+# Reinforcement Learning Dependencies for TORCS
+
+# Core RL library with extra dependencies (tensorboard, etc.)
+stable-baselines3[extra]>=2.0.0
+
+# Deep learning framework
+torch>=1.13.0
+
+# Gym environment framework
+gym>=0.21.0,<0.26.0
+
+# Numerical computing
+numpy>=1.21.0
+
+# Monitoring and logging
+tensorboard>=2.10.0
+
+# Additional utilities
+matplotlib>=3.5.0
+pandas>=1.4.0
+tqdm>=4.64.0
