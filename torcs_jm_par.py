@@ -541,34 +541,364 @@ def drive_example(c):
 #############################################
 
 import math
+from enum import Enum
 
-# ================= USER CONFIGURABLE PARAMETERS =================
-# Core driving parameters
-TARGET_SPEED = 70  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
-STEER_GAIN = 18     # Steering sensitivity. Higher values make the car turn more aggressively.
-CENTERING_GAIN = 0.60  # How strongly the car corrects its position toward the center of the track.
-BRAKE_THRESHOLD = 0.2  # Angle threshold for braking. Lower values brake earlier.
-GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]  # Speed thresholds for gear shifting.
-ENABLE_TRACTION_CONTROL = True  # Toggle traction control system.
+# ================= DRIVING STATES =================
+class DrivingState(Enum):
+    STRAIGHT = 1        # High speed cruising on straights
+    CORNER_APPROACH = 2 # Preparing for turn, braking zone
+    CORNER_ENTRY = 3    # Turn-in phase
+    APEX = 4            # Mid-corner, minimum speed point
+    CORNER_EXIT = 5     # Accelerating out of corner
+    RECOVERY = 6        # Correcting mistakes, off-line or unstable
 
-# Throttle control parameters (NEW)
-THROTTLE_INCREASE = 0.4  # Acceleration rate when below target speed (0.2-0.8)
-THROTTLE_DECREASE = 0.2  # Deceleration rate when above target speed (0.1-0.5)
-SPEED_STEER_FACTOR = 2.5  # How much steering affects target speed reduction (1.0-5.0)
+# ================= STATE-SPECIFIC PARAMETERS =================
+# Each state has its own parameter set for optimal behavior
+# Format: { state: { param_name: value } }
 
-# Brake control parameters (NEW)
-BRAKE_INTENSITY = 0.3  # Braking force when threshold exceeded (0.1-0.8)
+STATE_PARAMS = {
+    DrivingState.STRAIGHT: {
+        'TARGET_SPEED': 280,
+        'STEER_GAIN': 15,
+        'CENTERING_GAIN': 0.3,
+        'BRAKE_INTENSITY': 0.0,
+        'THROTTLE_INCREASE': 0.6,
+        'THROTTLE_DECREASE': 0.2,
+    },
+    DrivingState.CORNER_APPROACH: {
+        'TARGET_SPEED': 180,
+        'STEER_GAIN': 30,
+        'CENTERING_GAIN': 0.1,
+        'BRAKE_INTENSITY': 0.4,
+        'THROTTLE_INCREASE': 0.3,
+        'THROTTLE_DECREASE': 0.4,
+    },
+    DrivingState.CORNER_ENTRY: {
+        'TARGET_SPEED': 120,
+        'STEER_GAIN': 50,
+        'CENTERING_GAIN': 0.0,
+        'BRAKE_INTENSITY': 0.6,
+        'THROTTLE_INCREASE': 0.2,
+        'THROTTLE_DECREASE': 0.5,
+    },
+    DrivingState.APEX: {
+        'TARGET_SPEED': 100,
+        'STEER_GAIN': 60,
+        'CENTERING_GAIN': 0.0,
+        'BRAKE_INTENSITY': 0.0,
+        'THROTTLE_INCREASE': 0.3,
+        'THROTTLE_DECREASE': 0.3,
+    },
+    DrivingState.CORNER_EXIT: {
+        'TARGET_SPEED': 200,
+        'STEER_GAIN': 40,
+        'CENTERING_GAIN': 0.0,
+        'BRAKE_INTENSITY': 0.0,
+        'THROTTLE_INCREASE': 0.8,
+        'THROTTLE_DECREASE': 0.1,
+    },
+    DrivingState.RECOVERY: {
+        'TARGET_SPEED': 80,
+        'STEER_GAIN': 70,
+        'CENTERING_GAIN': 1.5,
+        'BRAKE_INTENSITY': 0.2,
+        'THROTTLE_INCREASE': 0.2,
+        'THROTTLE_DECREASE': 0.4,
+    },
+}
 
-# Traction control parameters (NEW)
+# ================= STATE TRANSITION THRESHOLDS =================
+# Curvature thresholds for state transitions
+CURVATURE_STRAIGHT_MAX = 0.1       # Below this = straight
+CURVATURE_CORNER_MIN = 0.15        # Above this = entering corner zone
+CURVATURE_APEX_MIN = 0.3           # High curvature = apex zone
+
+# Track sensor thresholds
+TRACK_FORWARD_STRAIGHT = 150       # Forward distance threshold for straight
+TRACK_FORWARD_APPROACH = 120       # Forward distance dropping = approaching corner
+TRACK_FORWARD_CORNER = 80          # In corner zone
+TRACK_MIN_APEX = 40                # Minimum track sensor value at apex
+
+# Recovery thresholds
+RECOVERY_TRACKPOS_THRESHOLD = 0.85 # |trackPos| above this triggers recovery
+RECOVERY_ANGLE_THRESHOLD = 0.5     # |angle| above this triggers recovery
+
+# ================= GLOBAL PARAMETERS (shared across states) =================
+GEAR_SPEEDS = [0, 50, 80, 120, 150, 200]  # Speed thresholds for gear shifting
+ENABLE_TRACTION_CONTROL = True  # Toggle traction control system
 TC_THRESHOLD = 2  # Wheel spin differential to trigger TC (1-10)
 TC_REDUCTION = 0.1  # Throttle reduction when TC activates (0.05-0.3)
+SPEED_STEER_FACTOR = 2.5  # How much steering affects target speed reduction (1.0-5.0)
 
-# ================= HELPER FUNCTIONS =================
+# Legacy parameters (for backward compatibility)
+TARGET_SPEED = 70
+STEER_GAIN = 18
+CENTERING_GAIN = 0.60
+BRAKE_THRESHOLD = 0.2
+THROTTLE_INCREASE = 0.4
+THROTTLE_DECREASE = 0.2
+BRAKE_INTENSITY = 0.3
+
+# ================= STATE MACHINE CLASS =================
+class StateMachine:
+    """
+    Hybrid state machine for reactive driving control.
+
+    Uses real-time sensor data to determine current driving state and
+    applies state-specific parameters for optimal control.
+    """
+
+    def __init__(self):
+        self.current_state = DrivingState.STRAIGHT
+        self.prev_state = DrivingState.STRAIGHT
+        self.prev_curvature = 0.0
+        self.prev_track_forward = 0.0  # Start at 0 to avoid false "decreasing" on first frame
+        self.state_duration = 0  # Steps in current state
+        self.startup_frames = 0  # Count frames since start for startup logic
+
+    def calculate_curvature(self, S):
+        """
+        Estimate track curvature from the 19 track edge sensors.
+
+        Uses left/right sensor asymmetry to detect turn direction and severity.
+        Sensors are at angles: -45, -19, -12, -7, -4, -2.5, -1.7, -1, -0.5, 0,
+                               0.5, 1, 1.7, 2.5, 4, 7, 12, 19, 45 degrees
+
+        Returns:
+            float: Curvature estimate (-1 to +1)
+                   Negative = left turn, Positive = right turn
+                   Magnitude indicates severity
+        """
+        track = S.get('track', [100] * 19)
+
+        # Use outer sensors for early detection (indices 0-2 for left, 16-18 for right)
+        left_sum = track[0] + track[1] + track[2]    # -45°, -19°, -12°
+        right_sum = track[16] + track[17] + track[18]  # +12°, +19°, +45°
+
+        # Avoid division by zero
+        total = left_sum + right_sum + 1.0
+
+        # Curvature: positive = right turn, negative = left turn
+        curvature = (right_sum - left_sum) / total
+
+        return curvature
+
+    def get_track_forward(self, S):
+        """Get forward track sensor distance (sensor index 9 = 0 degrees)."""
+        track = S.get('track', [100] * 19)
+        return track[9] if len(track) > 9 else 100.0
+
+    def get_track_minimum(self, S):
+        """Get minimum distance to any track edge."""
+        track = S.get('track', [100] * 19)
+        return min(track) if track else 100.0
+
+    def determine_state(self, S):
+        """
+        Determine the appropriate driving state based on current sensor data.
+
+        Transition Logic:
+        1. RECOVERY takes priority if car is off-line or unstable
+        2. Use curvature and track sensors to detect corner phases
+        3. Smooth transitions to avoid oscillation
+        4. Startup protection: stay in STRAIGHT for first few frames to accelerate
+
+        Args:
+            S: Server state dictionary with sensor data
+
+        Returns:
+            DrivingState: The determined driving state
+        """
+        # Increment startup counter
+        self.startup_frames += 1
+
+        # Get sensor data
+        track_pos = abs(S.get('trackPos', 0))
+        angle = abs(S.get('angle', 0))
+        speed = S.get('speedX', 0)
+        curvature = self.calculate_curvature(S)
+        curv_abs = abs(curvature)
+        track_forward = self.get_track_forward(S)
+        track_min = self.get_track_minimum(S)
+
+        # Rate-of-change calculations (skip on first frame to avoid false triggers)
+        if self.startup_frames <= 1:
+            curvature_increasing = False
+            curvature_decreasing = False
+            track_forward_decreasing = False
+            track_forward_increasing = False
+        else:
+            curvature_increasing = curv_abs > abs(self.prev_curvature) + 0.02
+            curvature_decreasing = curv_abs < abs(self.prev_curvature) - 0.02
+            track_forward_decreasing = track_forward < self.prev_track_forward - 5
+            track_forward_increasing = track_forward > self.prev_track_forward + 5
+
+        # Update previous values
+        self.prev_curvature = curvature
+        self.prev_track_forward = track_forward
+
+        # Priority 0: Startup protection - stay in STRAIGHT until we have some speed
+        # This ensures the car accelerates off the line before considering corner states
+        if speed < 20 and self.startup_frames < 100:  # First ~2 seconds at low speed
+            # Only enter RECOVERY if really necessary
+            if track_pos > RECOVERY_TRACKPOS_THRESHOLD or angle > RECOVERY_ANGLE_THRESHOLD:
+                return DrivingState.RECOVERY
+            return DrivingState.STRAIGHT
+
+        # Priority 1: RECOVERY state
+        if track_pos > RECOVERY_TRACKPOS_THRESHOLD or angle > RECOVERY_ANGLE_THRESHOLD:
+            return DrivingState.RECOVERY
+
+        # Priority 2: Determine corner phase based on curvature and track sensors
+
+        # STRAIGHT: Low curvature OR long forward distance with moderate curvature
+        # Relaxed condition: also consider STRAIGHT if forward distance is very long
+        if curv_abs < CURVATURE_STRAIGHT_MAX:
+            return DrivingState.STRAIGHT
+        if track_forward > TRACK_FORWARD_STRAIGHT and curv_abs < CURVATURE_CORNER_MIN:
+            return DrivingState.STRAIGHT
+
+        # CORNER_APPROACH: Moderate curvature starting, forward distance dropping
+        # Require actual speed before entering braking states
+        if curv_abs >= CURVATURE_CORNER_MIN and track_forward > TRACK_FORWARD_CORNER:
+            if speed > 50 and (track_forward_decreasing or curvature_increasing):
+                return DrivingState.CORNER_APPROACH
+
+        # APEX: High curvature, close to track edge
+        if curv_abs >= CURVATURE_APEX_MIN and track_min < TRACK_MIN_APEX:
+            return DrivingState.APEX
+
+        # CORNER_ENTRY: Entering the corner, curvature increasing
+        if curv_abs >= CURVATURE_CORNER_MIN and track_forward <= TRACK_FORWARD_CORNER:
+            if curvature_increasing or self.current_state == DrivingState.CORNER_APPROACH:
+                return DrivingState.CORNER_ENTRY
+
+        # CORNER_EXIT: Curvature decreasing, forward distance increasing
+        if curv_abs >= CURVATURE_STRAIGHT_MAX:
+            if curvature_decreasing and track_forward_increasing:
+                return DrivingState.CORNER_EXIT
+            if self.current_state in [DrivingState.APEX, DrivingState.CORNER_ENTRY]:
+                if track_forward_increasing:
+                    return DrivingState.CORNER_EXIT
+
+        # Default: Stay in current state or go to appropriate fallback
+        if self.current_state == DrivingState.RECOVERY:
+            # Exit recovery when conditions normalize
+            if track_pos < RECOVERY_TRACKPOS_THRESHOLD * 0.8 and angle < RECOVERY_ANGLE_THRESHOLD * 0.8:
+                return DrivingState.STRAIGHT
+
+        # If no clear transition, maintain current state
+        return self.current_state
+
+    def update(self, S):
+        """
+        Update state machine with new sensor data.
+
+        Args:
+            S: Server state dictionary
+
+        Returns:
+            tuple: (new_state, state_changed)
+        """
+        new_state = self.determine_state(S)
+        state_changed = new_state != self.current_state
+
+        if state_changed:
+            self.prev_state = self.current_state
+            self.current_state = new_state
+            self.state_duration = 0
+        else:
+            self.state_duration += 1
+
+        return new_state, state_changed
+
+    def get_params(self):
+        """Get parameters for current state."""
+        return STATE_PARAMS.get(self.current_state, STATE_PARAMS[DrivingState.STRAIGHT])
+
+    def reset(self):
+        """Reset state machine to initial state."""
+        self.current_state = DrivingState.STRAIGHT
+        self.prev_state = DrivingState.STRAIGHT
+        self.prev_curvature = 0.0
+        self.prev_track_forward = 0.0  # Start at 0 to avoid false "decreasing" on first frame
+        self.state_duration = 0
+        self.startup_frames = 0
+
+
+# Global state machine instance
+_state_machine = StateMachine()
+
+def get_state_machine():
+    """Get the global state machine instance."""
+    global _state_machine
+    return _state_machine
+
+def reset_state_machine():
+    """Reset the global state machine."""
+    global _state_machine
+    _state_machine.reset()
+
+
+# ================= HELPER FUNCTIONS (State-Aware) =================
+def calculate_steering_state(S, params):
+    """Calculate steering using state-specific parameters."""
+    steer_gain = params.get('STEER_GAIN', STEER_GAIN)
+    centering_gain = params.get('CENTERING_GAIN', CENTERING_GAIN)
+    steer = (S['angle'] * steer_gain / math.pi) - (S['trackPos'] * centering_gain)
+    return max(-1, min(1, steer))
+
+def calculate_throttle_state(S, R, params):
+    """Calculate throttle using state-specific parameters."""
+    target_speed = params.get('TARGET_SPEED', TARGET_SPEED)
+    throttle_inc = params.get('THROTTLE_INCREASE', THROTTLE_INCREASE)
+    throttle_dec = params.get('THROTTLE_DECREASE', THROTTLE_DECREASE)
+
+    if S['speedX'] < target_speed - (R['steer'] * SPEED_STEER_FACTOR):
+        accel = min(1.0, R['accel'] + throttle_inc)
+    else:
+        accel = max(0.0, R['accel'] - throttle_dec)
+    if S['speedX'] < 10:
+        accel += 1 / (S['speedX'] + 0.1)
+    return max(0.0, min(1.0, accel))
+
+def apply_brakes_state(S, params):
+    """Apply brakes using state-specific parameters."""
+    brake_intensity = params.get('BRAKE_INTENSITY', BRAKE_INTENSITY)
+    # Don't brake at low speeds - need to accelerate first
+    # This prevents braking from standstill when entering corner states early
+    speed = S.get('speedX', 0)
+    if speed < 30:  # Below 30 km/h, don't brake
+        return 0.0
+    # Scale braking for speeds between 30-60 km/h
+    if speed < 60:
+        return brake_intensity * (speed - 30) / 30.0
+    return brake_intensity
+
+def shift_gears(S):
+    """Shift gears based on speed (unchanged from original)."""
+    gear = 1
+    for i, speed in enumerate(GEAR_SPEEDS):
+        if S['speedX'] > speed:
+            gear = i + 1
+    return min(gear, 6)
+
+def traction_control(S, accel):
+    """Apply traction control (unchanged from original)."""
+    if ENABLE_TRACTION_CONTROL:
+        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > TC_THRESHOLD:
+            accel -= TC_REDUCTION
+    return max(0.0, accel)
+
+
+# ================= LEGACY HELPER FUNCTIONS (for backward compatibility) =================
 def calculate_steering(S):
+    """Legacy steering calculation (non-state-aware)."""
     steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
     return max(-1, min(1, steer))
 
 def calculate_throttle(S, R):
+    """Legacy throttle calculation (non-state-aware)."""
     if S['speedX'] < TARGET_SPEED - (R['steer'] * SPEED_STEER_FACTOR):
         accel = min(1.0, R['accel'] + THROTTLE_INCREASE)
     else:
@@ -578,20 +908,8 @@ def calculate_throttle(S, R):
     return max(0.0, min(1.0, accel))
 
 def apply_brakes(S):
+    """Legacy braking (non-state-aware)."""
     return BRAKE_INTENSITY if abs(S['angle']) > BRAKE_THRESHOLD else 0.0
-
-def shift_gears(S):
-    gear = 1
-    for i, speed in enumerate(GEAR_SPEEDS):
-        if S['speedX'] > speed:
-            gear = i + 1
-    return min(gear, 6)
-
-def traction_control(S, accel):
-    if ENABLE_TRACTION_CONTROL:
-        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > TC_THRESHOLD:
-            accel -= TC_REDUCTION
-    return max(0.0, accel)
 
 # ================= LAP TIME EXTRACTION SYSTEM =================
 class LapTimeTracker:
@@ -715,8 +1033,49 @@ class LapTimeTracker:
         self._step_count = 0
 
 
-# ================= MAIN DRIVE FUNCTION =================
+# ================= MAIN DRIVE FUNCTIONS =================
+def drive_state_machine(c, state_machine=None, verbose=False):
+    """
+    Drive using the hybrid state machine approach.
+
+    This is the recommended drive function for competition use.
+
+    Args:
+        c: Client instance
+        state_machine: StateMachine instance (uses global if None)
+        verbose: Print state transitions
+    """
+    S, R = c.S.d, c.R.d
+
+    # Get or create state machine
+    if state_machine is None:
+        state_machine = get_state_machine()
+
+    # Update state machine and get current state
+    new_state, state_changed = state_machine.update(S)
+
+    if verbose and state_changed:
+        print(f"  State: {state_machine.prev_state.name} -> {new_state.name}")
+
+    # Get parameters for current state
+    params = state_machine.get_params()
+
+    # Apply state-specific control
+    R['steer'] = calculate_steering_state(S, params)
+    R['accel'] = calculate_throttle_state(S, R, params)
+    R['brake'] = apply_brakes_state(S, params)
+    R['accel'] = traction_control(S, R['accel'])
+    R['gear'] = shift_gears(S)
+
+    return new_state
+
+
 def drive_modular(c):
+    """
+    Legacy drive function using global parameters (non-state-aware).
+
+    Kept for backward compatibility.
+    """
     S, R = c.S.d, c.R.d
     R['steer'] = calculate_steering(S)
     R['accel'] = calculate_throttle(S, R)
@@ -725,18 +1084,92 @@ def drive_modular(c):
     R['gear'] = shift_gears(S)
     return
 
+
+# ================= STATE PARAMETER SETTERS =================
+def set_state_params(state, params):
+    """
+    Set parameters for a specific state.
+
+    Args:
+        state: DrivingState enum value
+        params: dict with parameter values to update
+    """
+    if state in STATE_PARAMS:
+        STATE_PARAMS[state].update(params)
+
+def set_all_state_params(all_params):
+    """
+    Set parameters for all states at once.
+
+    Args:
+        all_params: dict mapping DrivingState to param dicts
+    """
+    for state, params in all_params.items():
+        if state in STATE_PARAMS:
+            STATE_PARAMS[state].update(params)
+
+def get_all_state_params():
+    """Get a copy of all state parameters."""
+    return {state: params.copy() for state, params in STATE_PARAMS.items()}
+
+def set_transition_thresholds(thresholds):
+    """
+    Set state transition thresholds.
+
+    Args:
+        thresholds: dict with threshold names and values
+    """
+    global CURVATURE_STRAIGHT_MAX, CURVATURE_CORNER_MIN, CURVATURE_APEX_MIN
+    global TRACK_FORWARD_STRAIGHT, TRACK_FORWARD_APPROACH, TRACK_FORWARD_CORNER
+    global TRACK_MIN_APEX, RECOVERY_TRACKPOS_THRESHOLD, RECOVERY_ANGLE_THRESHOLD
+
+    if 'CURVATURE_STRAIGHT_MAX' in thresholds:
+        CURVATURE_STRAIGHT_MAX = thresholds['CURVATURE_STRAIGHT_MAX']
+    if 'CURVATURE_CORNER_MIN' in thresholds:
+        CURVATURE_CORNER_MIN = thresholds['CURVATURE_CORNER_MIN']
+    if 'CURVATURE_APEX_MIN' in thresholds:
+        CURVATURE_APEX_MIN = thresholds['CURVATURE_APEX_MIN']
+    if 'TRACK_FORWARD_STRAIGHT' in thresholds:
+        TRACK_FORWARD_STRAIGHT = thresholds['TRACK_FORWARD_STRAIGHT']
+    if 'TRACK_FORWARD_APPROACH' in thresholds:
+        TRACK_FORWARD_APPROACH = thresholds['TRACK_FORWARD_APPROACH']
+    if 'TRACK_FORWARD_CORNER' in thresholds:
+        TRACK_FORWARD_CORNER = thresholds['TRACK_FORWARD_CORNER']
+    if 'TRACK_MIN_APEX' in thresholds:
+        TRACK_MIN_APEX = thresholds['TRACK_MIN_APEX']
+    if 'RECOVERY_TRACKPOS_THRESHOLD' in thresholds:
+        RECOVERY_TRACKPOS_THRESHOLD = thresholds['RECOVERY_TRACKPOS_THRESHOLD']
+    if 'RECOVERY_ANGLE_THRESHOLD' in thresholds:
+        RECOVERY_ANGLE_THRESHOLD = thresholds['RECOVERY_ANGLE_THRESHOLD']
+
 # ================= MAIN LOOP =================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description='TORCS State Machine Driver')
+    parser.add_argument('--legacy', action='store_true', help='Use legacy non-state-aware driving')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Print state transitions')
+    args, unknown = parser.parse_known_args()
+
     C = Client(p=3001)
     lap_tracker = LapTimeTracker()
+    state_machine = StateMachine()
 
-    print("Starting simulation with lap time tracking...")
+    mode = "Legacy (non-state-aware)" if args.legacy else "State Machine (6 states)"
+    print(f"Starting simulation with {mode} mode...")
     print("-" * 50)
+
+    # State statistics
+    state_counts = {state: 0 for state in DrivingState}
 
     for step in range(C.maxSteps, 0, -1):
         C.get_servers_input()
         if C.S.d:  # Only process if we have valid server state
-            drive_modular(C)
+            if args.legacy:
+                drive_modular(C)
+            else:
+                current_state = drive_state_machine(C, state_machine, verbose=args.verbose)
+                state_counts[current_state] += 1
 
             # Update lap tracker
             lap_tracker.update(C.S.d)
@@ -760,5 +1193,15 @@ if __name__ == "__main__":
         print(f"All lap times: {[f'{t:.3f}' for t in stats['all_laps']]}")
     else:
         print("No complete laps recorded.")
+
+    # State machine statistics
+    if not args.legacy:
+        print("-" * 50)
+        print("State Machine Statistics:")
+        total_steps = sum(state_counts.values())
+        for state in DrivingState:
+            count = state_counts[state]
+            pct = (count / total_steps * 100) if total_steps > 0 else 0
+            print(f"  {state.name:20s}: {count:6d} steps ({pct:5.1f}%)")
 
     C.shutdown()

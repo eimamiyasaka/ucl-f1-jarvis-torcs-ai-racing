@@ -13,7 +13,13 @@ from datetime import datetime
 from torcs_jm_par import (
     Client, LapTimeTracker,
     calculate_steering, calculate_throttle, apply_brakes,
-    shift_gears, traction_control
+    shift_gears, traction_control,
+    # State machine imports
+    DrivingState, StateMachine, STATE_PARAMS,
+    drive_state_machine, drive_modular,
+    set_state_params, set_all_state_params, get_all_state_params,
+    set_transition_thresholds, reset_state_machine,
+    calculate_steering_state, calculate_throttle_state, apply_brakes_state
 )
 import torcs_jm_par as torcs_module
 
@@ -233,6 +239,253 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
             print(f"Episode complete: {stats['lap_count']} laps, best={stats['best_lap']}")
 
     return result
+
+
+def run_episode_state_machine(state_params, port=3001, max_steps=100000, target_laps=1, verbose=True,
+                               off_track_threshold=None, restart=True,
+                               start_min_distance=None, start_check_steps=None,
+                               transition_thresholds=None):
+    """
+    Run a single episode using the hybrid state machine with given state parameters.
+
+    Args:
+        state_params: dict mapping DrivingState to parameter dicts, e.g.:
+            {
+                DrivingState.STRAIGHT: {'TARGET_SPEED': 280, 'STEER_GAIN': 15, ...},
+                DrivingState.CORNER_APPROACH: {'TARGET_SPEED': 180, ...},
+                ...
+            }
+        port: TORCS server port (default 3001)
+        max_steps: Maximum simulation steps (default 100000)
+        target_laps: Number of laps to complete before stopping (default 1)
+        verbose: Print progress info (default True)
+        off_track_threshold: Max |trackPos| before DNF (default 1.3)
+        restart: If True, request race restart for next episode (default True)
+        start_min_distance: Minimum distance car must travel within start_check_steps
+        start_check_steps: Number of steps to check start distance
+        transition_thresholds: Optional dict of state transition thresholds
+
+    Returns:
+        dict with:
+            - lap_time: Best lap time (None if no laps completed or DNF)
+            - lap_times: List of all lap times
+            - lap_count: Number of laps completed
+            - avg_lap_time: Average lap time (None if no laps)
+            - total_steps: Steps used
+            - completed: True if target_laps reached
+            - dnf: True if episode ended due to DNF condition
+            - dnf_reason: String describing DNF cause (None if not DNF)
+            - state_counts: dict of step counts per state
+    """
+    # Set default thresholds
+    if off_track_threshold is None:
+        off_track_threshold = DEFAULT_OFF_TRACK_THRESHOLD
+    if start_min_distance is None:
+        start_min_distance = DEFAULT_START_MIN_DISTANCE
+    if start_check_steps is None:
+        start_check_steps = DEFAULT_START_CHECK_STEPS
+
+    # Apply state parameters to module
+    if state_params:
+        set_all_state_params(state_params)
+
+    # Apply transition thresholds if provided
+    if transition_thresholds:
+        set_transition_thresholds(transition_thresholds)
+
+    # Apply global parameters (gear speeds, TC, etc.) from any state or use defaults
+    # These are shared across all states
+    any_state_params = next(iter(state_params.values())) if state_params else {}
+    torcs_module.GEAR_SPEEDS = any_state_params.get('GEAR_SPEEDS', BASE_GEAR_SPEEDS)
+    torcs_module.ENABLE_TRACTION_CONTROL = any_state_params.get('ENABLE_TRACTION_CONTROL', True)
+    torcs_module.TC_THRESHOLD = any_state_params.get('TC_THRESHOLD', 2)
+    torcs_module.TC_REDUCTION = any_state_params.get('TC_REDUCTION', 0.1)
+    torcs_module.SPEED_STEER_FACTOR = any_state_params.get('SPEED_STEER_FACTOR', 2.5)
+
+    if verbose:
+        print("Running episode with STATE MACHINE mode")
+        print("State parameters:")
+        for state, params in state_params.items():
+            # Handle both DrivingState enum and string keys (like '_GLOBAL')
+            state_name = state.name if hasattr(state, 'name') else str(state)
+            print(f"  {state_name}:")
+            for key, value in params.items():
+                print(f"    {key}: {value}")
+
+    # Initialize client, tracker, and state machine
+    C = Client(p=port)
+    C.maxSteps = max_steps
+    tracker = LapTimeTracker()
+    state_machine = StateMachine()
+    reset_state_machine()
+
+    steps_used = 0
+    dnf = False
+    dnf_reason = None
+    start_check_done = False
+    state_counts = {state: 0 for state in DrivingState}
+
+    try:
+        for step in range(max_steps, 0, -1):
+            C.get_servers_input()
+            if C.so is None:
+                break
+
+            if C.S.d:
+                S, R = C.S.d, C.R.d
+
+                # DNF check: car too far off track
+                track_pos = S.get('trackPos', 0)
+                if off_track_threshold and abs(track_pos) > off_track_threshold:
+                    dnf = True
+                    dnf_reason = f"off-track (trackPos={track_pos:.2f}, threshold={off_track_threshold})"
+                    if verbose:
+                        print(f"  DNF: {dnf_reason}")
+                    steps_used = max_steps - step
+                    break
+
+                # DNF check: car facing backward
+                angle = S.get('angle', 0)
+                if math.cos(angle) < 0:
+                    dnf = True
+                    dnf_reason = f"facing backward (angle={math.degrees(angle):.1f}°)"
+                    if verbose:
+                        print(f"  DNF: {dnf_reason}")
+                    steps_used = max_steps - step
+                    break
+
+                # DNF check: car stalled at start
+                current_step = max_steps - step
+                if start_min_distance and not start_check_done and current_step >= start_check_steps:
+                    dist_raced = S.get('distRaced', 0)
+                    if dist_raced < start_min_distance:
+                        dnf = True
+                        dnf_reason = f"stalled at start (distRaced={dist_raced:.1f}m after {start_check_steps} steps)"
+                        if verbose:
+                            print(f"  DNF: {dnf_reason}")
+                        steps_used = current_step
+                        break
+                    start_check_done = True
+
+                # Drive using state machine
+                current_state = drive_state_machine(C, state_machine, verbose=False)
+                state_counts[current_state] += 1
+
+                # Track lap times
+                tracker.update(C.S.d)
+
+                if tracker.lap_just_completed and verbose:
+                    print(f"  Lap {tracker.lap_count}: {tracker.last_lap_time:.3f}s")
+
+                # Stop if we've completed target laps
+                if tracker.lap_count >= target_laps:
+                    steps_used = max_steps - step
+                    break
+
+            C.respond_to_server()
+            steps_used = max_steps - step
+
+    finally:
+        if restart:
+            C.restart_race()
+        else:
+            C.shutdown()
+
+    # Build result
+    stats = tracker.get_stats()
+    result = {
+        'lap_time': None if dnf else stats['best_lap'],
+        'lap_times': stats['all_laps'],
+        'lap_count': stats['lap_count'],
+        'avg_lap_time': stats['avg_lap'],
+        'total_steps': steps_used,
+        'completed': stats['lap_count'] >= target_laps and not dnf,
+        'dnf': dnf,
+        'dnf_reason': dnf_reason,
+        'state_counts': state_counts
+    }
+
+    if verbose:
+        if dnf:
+            print(f"Episode DNF: {dnf_reason}")
+        else:
+            print(f"Episode complete: {stats['lap_count']} laps, best={stats['best_lap']}")
+        # Print state distribution
+        total = sum(state_counts.values())
+        if total > 0:
+            print("State distribution:")
+            for state in DrivingState:
+                pct = state_counts[state] / total * 100
+                print(f"  {state.name:20s}: {pct:5.1f}%")
+
+    return result
+
+
+def get_default_state_params():
+    """
+    Return default state parameters for all 6 driving states.
+
+    These are reasonable defaults that should work on most tracks.
+    The GA optimizer can tune these for specific tracks.
+    """
+    return {
+        DrivingState.STRAIGHT: {
+            'TARGET_SPEED': 280,
+            'STEER_GAIN': 15,
+            'CENTERING_GAIN': 0.3,
+            'BRAKE_INTENSITY': 0.0,
+            'THROTTLE_INCREASE': 0.6,
+            'THROTTLE_DECREASE': 0.2,
+        },
+        DrivingState.CORNER_APPROACH: {
+            'TARGET_SPEED': 180,
+            'STEER_GAIN': 30,
+            'CENTERING_GAIN': 0.1,
+            'BRAKE_INTENSITY': 0.4,
+            'THROTTLE_INCREASE': 0.3,
+            'THROTTLE_DECREASE': 0.4,
+        },
+        DrivingState.CORNER_ENTRY: {
+            'TARGET_SPEED': 120,
+            'STEER_GAIN': 50,
+            'CENTERING_GAIN': 0.0,
+            'BRAKE_INTENSITY': 0.6,
+            'THROTTLE_INCREASE': 0.2,
+            'THROTTLE_DECREASE': 0.5,
+        },
+        DrivingState.APEX: {
+            'TARGET_SPEED': 100,
+            'STEER_GAIN': 60,
+            'CENTERING_GAIN': 0.0,
+            'BRAKE_INTENSITY': 0.0,
+            'THROTTLE_INCREASE': 0.3,
+            'THROTTLE_DECREASE': 0.3,
+        },
+        DrivingState.CORNER_EXIT: {
+            'TARGET_SPEED': 200,
+            'STEER_GAIN': 40,
+            'CENTERING_GAIN': 0.0,
+            'BRAKE_INTENSITY': 0.0,
+            'THROTTLE_INCREASE': 0.8,
+            'THROTTLE_DECREASE': 0.1,
+        },
+        DrivingState.RECOVERY: {
+            'TARGET_SPEED': 80,
+            'STEER_GAIN': 70,
+            'CENTERING_GAIN': 1.5,
+            'BRAKE_INTENSITY': 0.2,
+            'THROTTLE_INCREASE': 0.2,
+            'THROTTLE_DECREASE': 0.4,
+        },
+        # Global parameters (shared across states)
+        '_GLOBAL': {
+            'GEAR_SPEEDS': [0, 50, 80, 120, 150, 200],
+            'ENABLE_TRACTION_CONTROL': True,
+            'TC_THRESHOLD': 2.0,
+            'TC_REDUCTION': 0.1,
+            'SPEED_STEER_FACTOR': 2.5,
+        }
+    }
 
 
 def get_default_params():
