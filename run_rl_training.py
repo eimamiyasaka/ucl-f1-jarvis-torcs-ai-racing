@@ -72,13 +72,19 @@ def test_environment(port=3001):
         return False
 
 
-def quick_train(timesteps=500000, port=3001, target_time=None):
+def quick_train(timesteps=500000, port=3001, target_time=None, no_eval=False):
     """Start a quick training session with default settings."""
     print("="*60)
     print("Starting Quick Training Session")
     print("="*60)
     print(f"Timesteps: {timesteps:,}")
-    print(f"Port: {port}")
+    print(f"Training port: {port}")
+    if no_eval:
+        print(f"Evaluation: DISABLED (single TORCS instance mode)")
+    else:
+        print(f"Evaluation port: {port + 1}")
+        print(f"  NOTE: Requires second TORCS instance on port {port + 1}")
+        print(f"  Use --no-eval if you only have one TORCS instance")
     if target_time:
         print(f"Target lap time: {target_time}s")
     print("="*60)
@@ -96,6 +102,7 @@ def quick_train(timesteps=500000, port=3001, target_time=None):
             total_timesteps=timesteps,
             port=port,
             target_lap_time=target_time,
+            eval_freq=0 if no_eval else 10000,
             verbose=1
         )
         print(f"\n✓ Training completed!")
@@ -185,8 +192,11 @@ Examples:
   # Test environment connection
   python run_rl_training.py test
 
-  # Quick training (500k steps)
+  # Quick training (500k steps) - requires 2 TORCS instances
   python run_rl_training.py train
+
+  # Training with single TORCS instance (no evaluation)
+  python run_rl_training.py train --no-eval
 
   # Extended training (1M steps)
   python run_rl_training.py train --timesteps 1000000
@@ -216,6 +226,8 @@ Examples:
     train_parser.add_argument('--timesteps', type=int, default=500000, help='Training timesteps')
     train_parser.add_argument('--port', type=int, default=3001, help='TORCS port')
     train_parser.add_argument('--target-time', type=float, default=None, help='Target lap time')
+    train_parser.add_argument('--no-eval', action='store_true',
+                              help='Disable evaluation (use if only one TORCS instance)')
 
     # Eval command
     eval_parser = subparsers.add_parser('eval', help='Evaluate trained model')
@@ -245,7 +257,8 @@ Examples:
         quick_train(
             timesteps=args.timesteps,
             port=args.port,
-            target_time=args.target_time
+            target_time=args.target_time,
+            no_eval=args.no_eval
         )
 
     elif args.command == 'eval':

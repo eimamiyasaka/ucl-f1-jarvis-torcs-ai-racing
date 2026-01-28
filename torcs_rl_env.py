@@ -103,16 +103,30 @@ class TorcsRLEnv(gym.Env):
 
     def reset(self):
         """Reset the environment and return initial observation."""
+        import time
+
         # Shutdown previous client if exists
         if self.client is not None:
             try:
                 self.client.restart_race()
             except:
                 pass
+            # Wait for TORCS to process the restart request
+            time.sleep(0.3)
 
-        # Create new client connection
-        self.client = Client(p=self.port)
-        self.client.maxSteps = self.max_steps
+        # Create new client connection with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.client = Client(p=self.port)
+                self.client.maxSteps = self.max_steps
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.2)
+                else:
+                    raise RuntimeError(f"Failed to connect to TORCS after {max_retries} attempts: {e}")
+
         self.lap_tracker = LapTimeTracker()
 
         # Get initial state
@@ -223,26 +237,51 @@ class TorcsRLEnv(gym.Env):
         return obs
 
     def _auto_gear(self):
-        """Simple automatic gear shifting based on speed."""
+        """
+        Automatic gear shifting with hysteresis to prevent oscillation.
+        Uses different thresholds for upshifting and downshifting.
+        """
         if self.client.S.d is None:
             return 1
 
         speed = self.client.S.d.get('speedX', 0)
+        current_gear = self.client.S.d.get('gear', 1)
+
+        # Gear shift thresholds: (upshift_speed, downshift_speed)
+        # Upshift when speed exceeds upshift threshold
+        # Downshift when speed drops below downshift threshold
+        # The gap between them prevents oscillation
+        gear_thresholds = {
+            1: (55, None),    # Upshift to 2 at 55, no downshift from 1
+            2: (85, 45),      # Upshift to 3 at 85, downshift to 1 at 45
+            3: (125, 70),     # Upshift to 4 at 125, downshift to 2 at 70
+            4: (160, 110),    # Upshift to 5 at 160, downshift to 3 at 110
+            5: (200, 145),    # Upshift to 6 at 200, downshift to 4 at 145
+            6: (None, 185),   # No upshift from 6, downshift to 5 at 185
+        }
 
         if speed < 0:
             return -1
-        elif speed < 50:
+
+        # Handle reverse or neutral
+        if current_gear <= 0:
             return 1
-        elif speed < 80:
-            return 2
-        elif speed < 120:
-            return 3
-        elif speed < 150:
-            return 4
-        elif speed < 200:
-            return 5
-        else:
-            return 6
+
+        # Clamp to valid gear range
+        current_gear = max(1, min(6, current_gear))
+
+        upshift_speed, downshift_speed = gear_thresholds.get(current_gear, (None, None))
+
+        # Check for upshift
+        if upshift_speed is not None and speed > upshift_speed:
+            return current_gear + 1
+
+        # Check for downshift
+        if downshift_speed is not None and speed < downshift_speed:
+            return current_gear - 1
+
+        # Stay in current gear
+        return current_gear
 
     def _check_done(self, S):
         """
@@ -282,12 +321,18 @@ class TorcsRLEnv(gym.Env):
         """
         Calculate reward for current step.
 
-        Reward shaping for lap time optimization from standing start:
+        Reward shaping for lap time optimization from standing start.
+        Rewards are scaled to be in a consistent range for stable training:
+        - Per-step rewards: typically -1 to +1
+        - Terminal bonuses/penalties: scaled to ~10-50 range
+
+        Components:
         1. Progress reward: encourage forward movement
         2. Speed bonus: reward maintaining high speed
         3. Track position penalty: stay on racing line
-        4. Lap completion bonus: big reward for completing lap
-        5. DNF penalty: heavy penalty for crashes/off-track
+        4. Angle penalty: face forward
+        5. Lap completion bonus: reward for completing lap quickly
+        6. DNF penalty: penalty for crashes/off-track
         """
         reward = 0.0
 
@@ -299,59 +344,68 @@ class TorcsRLEnv(gym.Env):
 
         if self.reward_type == 'progress':
             # 1. Progress reward (main driver)
-            # Reward distance traveled weighted by speed efficiency
+            # Reward distance traveled - typically 0-5m per step at high speed
+            # Scale to give ~0.1-0.5 reward per step
             dist_progress = dist_raced - self.prev_dist_raced
             reward += dist_progress * 0.1
 
             # 2. Speed bonus (encourage maintaining high speed)
-            # Normalized speed reward (0 to 1 for speeds 0 to 300 km/h)
+            # Normalized speed reward (0 to 0.3 for speeds 0 to 300 km/h)
             speed_normalized = np.clip(speed / 300.0, 0, 1)
-            reward += speed_normalized * 0.05
+            reward += speed_normalized * 0.3
 
-            # 3. Track position penalty (stay near center)
-            # Quadratic penalty for being off-center
-            track_penalty = -track_pos ** 2 * 0.5
-            reward += track_penalty
+            # 3. Track position penalty (stay near center, but allow some deviation)
+            # Softer penalty - only significant when far from center
+            # trackPos of 0.5 gives penalty of -0.125, trackPos of 1.0 gives -0.5
+            if track_pos > 0.3:
+                track_penalty = -(track_pos - 0.3) ** 2 * 0.5
+                reward += track_penalty
 
-            # 4. Angle penalty (face forward)
-            angle_penalty = -abs(angle) * 0.2
+            # 4. Angle penalty (face forward) - scaled down
+            # Angle in radians, typically < 0.5 for normal driving
+            angle_penalty = -abs(angle) * 0.1
             reward += angle_penalty
 
             # 5. Lap completion bonus
             if self.lap_tracker.lap_just_completed:
-                # Big bonus inversely proportional to lap time
-                # Assuming 30-120s lap times, give 500-2000 bonus
+                # Bonus scaled based on lap time quality
+                # Target: ~60s lap = 50 bonus, ~90s lap = 33 bonus, ~120s lap = 25 bonus
                 lap_time = self.lap_tracker.last_lap_time
-                lap_bonus = 1000.0 / max(lap_time, 30.0) * 30.0
+                lap_bonus = 50.0 * (60.0 / max(lap_time, 30.0))
+                # Cap the bonus to prevent extreme values
+                lap_bonus = min(lap_bonus, 100.0)
                 reward += lap_bonus
 
-            # 6. DNF penalty
+            # 6. DNF penalty - scaled to be comparable to missing a lap bonus
             if done and dnf_reason is not None:
+                # Penalty based on progress made - less penalty if close to finishing
+                progress_fraction = min(dist_raced / 5000.0, 1.0)  # Assume ~5km track
                 if dnf_reason == 'off_track':
-                    reward -= 100.0
+                    reward -= 30.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'facing_backward':
-                    reward -= 100.0
+                    reward -= 30.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'stalled_start':
-                    reward -= 100.0
+                    reward -= 50.0  # Harsh penalty for not even starting
                 elif dnf_reason == 'max_steps':
-                    # Mild penalty for not completing
+                    # Mild penalty - agent was trying but too slow
                     reward -= 10.0
 
         elif self.reward_type == 'time':
             # Alternative: sparse reward based on lap time
-            # Only reward at lap completion
+            # Only significant reward at lap completion
             if self.lap_tracker.lap_just_completed:
                 lap_time = self.lap_tracker.last_lap_time
-                # Negative time (lower is better)
-                reward = -lap_time
+                # Reward inversely proportional to time (faster = better)
+                # ~60s lap = 100, ~90s lap = 67, ~120s lap = 50
+                reward = 100.0 * (60.0 / max(lap_time, 30.0))
             else:
-                # Small progress reward to guide learning
+                # Small progress reward to guide exploration
                 dist_progress = dist_raced - self.prev_dist_raced
-                reward = dist_progress * 0.01
+                reward = dist_progress * 0.02
 
             # DNF penalty
             if done and dnf_reason is not None:
-                reward -= 200.0
+                reward -= 50.0
 
         # Update previous values
         self.prev_dist_raced = dist_raced
@@ -373,6 +427,13 @@ class TorcsRLEnvVec:
     """
     Vectorized TORCS environment for parallel training.
     Creates multiple TORCS instances on different ports.
+
+    Note: For use with Stable-Baselines3, prefer using DummyVecEnv or
+    SubprocVecEnv wrappers around TorcsRLEnv instead, as they provide
+    better integration with SB3's training infrastructure.
+
+    This class implements auto-reset: when an episode ends, the environment
+    is automatically reset and the new observation is returned.
     """
 
     def __init__(self, n_envs=4, base_port=3001, **env_kwargs):
@@ -386,6 +447,8 @@ class TorcsRLEnvVec:
         """
         self.n_envs = n_envs
         self.envs = []
+        self.env_kwargs = env_kwargs
+        self.base_port = base_port
 
         for i in range(n_envs):
             port = base_port + i
@@ -401,14 +464,26 @@ class TorcsRLEnvVec:
         return np.array(obs_list)
 
     def step(self, actions):
-        """Step all environments with corresponding actions."""
+        """
+        Step all environments with corresponding actions.
+        Implements auto-reset: when an episode ends, the environment is
+        automatically reset and the new initial observation is returned.
+        """
         obs_list = []
         rewards = []
         dones = []
         infos = []
 
-        for env, action in zip(self.envs, actions):
+        for i, (env, action) in enumerate(zip(self.envs, actions)):
             obs, reward, done, info = env.step(action)
+
+            # Auto-reset on episode end
+            if done:
+                # Store terminal observation in info for algorithms that need it
+                info['terminal_observation'] = obs
+                # Reset and get new initial observation
+                obs = env.reset()
+
             obs_list.append(obs)
             rewards.append(reward)
             dones.append(done)
@@ -420,6 +495,16 @@ class TorcsRLEnvVec:
         """Close all environments."""
         for env in self.envs:
             env.close()
+
+    @property
+    def observation_space(self):
+        """Return observation space (same for all envs)."""
+        return self.envs[0].observation_space
+
+    @property
+    def action_space(self):
+        """Return action space (same for all envs)."""
+        return self.envs[0].action_space
 
 
 # Test the environment

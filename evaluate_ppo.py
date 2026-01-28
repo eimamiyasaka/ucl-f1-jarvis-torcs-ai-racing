@@ -9,6 +9,7 @@ import argparse
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 from torcs_rl_env import TorcsRLEnv
 
 
@@ -56,26 +57,40 @@ def evaluate_model(
     print("Loading model...")
     model = PPO.load(model_path)
 
-    # Create environment
+    # Create environment with Monitor wrapper
     def make_env():
-        return TorcsRLEnv(
+        env = TorcsRLEnv(
             port=port,
             max_steps=max_steps,
             target_laps=1,
             reward_type='progress'
         )
+        # Wrap with Monitor for episode statistics
+        env = Monitor(env)
+        return env
 
     env = DummyVecEnv([make_env])
 
-    # Try to load normalization stats
-    vec_normalize_path = os.path.join(os.path.dirname(model_path), 'vec_normalize.pkl')
-    if os.path.exists(vec_normalize_path):
-        print(f"Loading normalization stats from: {vec_normalize_path}")
-        env = VecNormalize.load(vec_normalize_path, env)
-        env.training = False  # Don't update stats during evaluation
-        env.norm_reward = False  # Don't normalize rewards
-    else:
-        print("Warning: No normalization stats found")
+    # Try to load normalization stats from multiple possible locations
+    # Handle different directory structures (e.g., best_model/best_model.zip)
+    possible_paths = [
+        os.path.join(os.path.dirname(model_path), 'vec_normalize.pkl'),
+        os.path.join(os.path.dirname(os.path.dirname(model_path)), 'vec_normalize.pkl'),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(model_path))), 'vec_normalize.pkl'),
+    ]
+
+    vec_normalize_loaded = False
+    for vec_normalize_path in possible_paths:
+        if os.path.exists(vec_normalize_path):
+            print(f"Loading normalization stats from: {vec_normalize_path}")
+            env = VecNormalize.load(vec_normalize_path, env)
+            env.training = False  # Don't update stats during evaluation
+            env.norm_reward = False  # Don't normalize rewards
+            vec_normalize_loaded = True
+            break
+
+    if not vec_normalize_loaded:
+        print("Warning: No normalization stats found - model may not perform correctly")
 
     # Evaluation loop
     episode_rewards = []
