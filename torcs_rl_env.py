@@ -170,9 +170,22 @@ class TorcsRLEnv(gym.Env):
         self.step_count += 1
 
         # Apply action
-        self.client.R.d['steer'] = np.clip(action[0], -1.0, 1.0)
-        self.client.R.d['accel'] = np.clip(action[1], 0.0, 1.0)
-        self.client.R.d['brake'] = np.clip(action[2], 0.0, 1.0)
+        steer = np.clip(action[0], -1.0, 1.0)
+        accel = np.clip(action[1], 0.0, 1.0)
+        brake = np.clip(action[2], 0.0, 1.0)
+
+        # Launch assist: help the car get moving from standstill
+        # In the first 100 steps, if speed is very low, boost acceleration
+        # and suppress braking to ensure the car actually moves
+        current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
+        if self.step_count < 100 and current_speed < 30:
+            # Force acceleration and disable brake at low speeds
+            accel = max(accel, 0.8)  # Ensure at least 80% throttle
+            brake = 0.0  # No braking when trying to launch
+
+        self.client.R.d['steer'] = steer
+        self.client.R.d['accel'] = accel
+        self.client.R.d['brake'] = brake
 
         # Simple automatic gear shifting
         self.client.R.d['gear'] = self._auto_gear()
