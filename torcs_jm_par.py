@@ -74,7 +74,10 @@ class Client():
         self.stage= 3 # 0=Warm-up, 1=Qualifying 2=Race, 3=unknown <Default=3>
         self.debug= False
         self.maxSteps= 100000  # 50steps/second
-        self.parse_the_command_line()
+        # Only parse command line if no explicit parameters provided (avoids conflicts
+        # when used as a library with other scripts that have their own arguments)
+        if H is None and p is None and i is None and e is None and t is None and s is None and d is None:
+            self.parse_the_command_line()
         if H: self.host= H
         if p: self.port= p
         if i: self.sid= i
