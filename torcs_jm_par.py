@@ -97,7 +97,9 @@ class Client():
             sys.exit(-1)
         self.so.settimeout(1)
 
-        n_fail = 5
+        # More patient connection logic for RL training
+        # TORCS needs time after race restart before scr_server is ready
+        n_fail = 15  # Wait up to ~15 seconds before considering restart
         max_restart_attempts = 3
         restart_attempts = 0
 
@@ -115,8 +117,7 @@ class Client():
                 sockdata,addr= self.so.recvfrom(data_size)
                 sockdata = sockdata.decode('utf-8')
             except socket.error as emsg:
-                print("Waiting for server on %d............" % self.port)
-                print("Count Down : " + str(n_fail))
+                print("Waiting for server on %d............ (%d)" % (self.port, n_fail))
                 if n_fail < 0:
                     restart_attempts += 1
                     if restart_attempts > max_restart_attempts:
@@ -158,7 +159,7 @@ class Client():
                             os.system('sh autostart.sh')
 
                     time.sleep(3.0)  # Give TORCS time to start
-                    n_fail = 5
+                    n_fail = 15  # Reset countdown
                 n_fail -= 1
 
             identify = '***identified***'
@@ -260,15 +261,15 @@ class Client():
     def restart_race(self):
         """Request TORCS to restart the race via meta flag, then close connection.
 
-        This is faster than relaunching TORCS - the server resets the car position
-        and race state without restarting the process.
+        This triggers a full race restart in TORCS. The server will reload the
+        track and reset car positions, which takes a few seconds.
         """
         if not self.so: return
         print("Requesting race restart on port %d..." % self.port)
         self.R.d['meta'] = 1
         try:
             self.respond_to_server()
-            time.sleep(0.1)  # Brief pause for server to process
+            time.sleep(0.5)  # Give server time to process before closing
         except:
             pass  # Server may close connection immediately
         self.so.close()

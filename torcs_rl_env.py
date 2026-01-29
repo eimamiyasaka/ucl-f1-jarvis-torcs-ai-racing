@@ -114,11 +114,12 @@ class TorcsRLEnv(gym.Env):
                 self.client.restart_race()
             except:
                 pass
-            # Wait for TORCS to process the restart request
-            time.sleep(0.3)
+            # Wait for TORCS to fully process the restart request
+            # TORCS needs several seconds to reload the race
+            time.sleep(2.0)
 
         # Create new client connection with retry logic
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 self.client = Client(p=self.port)
@@ -126,7 +127,8 @@ class TorcsRLEnv(gym.Env):
                 break
             except Exception as e:
                 if attempt < max_retries - 1:
-                    time.sleep(0.2)
+                    print(f"Connection attempt {attempt + 1} failed, retrying...")
+                    time.sleep(1.0)
                 else:
                     raise RuntimeError(f"Failed to connect to TORCS after {max_retries} attempts: {e}")
 
@@ -142,6 +144,13 @@ class TorcsRLEnv(gym.Env):
         self.prev_speed = 0.0
         self.start_check_done = False
         self.total_reward = 0.0
+
+        # Debug: show initial state
+        if self.client.S.d:
+            print(f"[Episode {self.episode_count}] Reset complete - "
+                  f"speed={self.client.S.d.get('speedX', 0):.1f}, "
+                  f"trackPos={self.client.S.d.get('trackPos', 0):.2f}, "
+                  f"distRaced={self.client.S.d.get('distRaced', 0):.1f}")
 
         # Return initial observation and info dict (gymnasium API)
         obs = self._get_observation()
@@ -209,6 +218,12 @@ class TorcsRLEnv(gym.Env):
             'dnf': dnf_reason is not None,
             'dnf_reason': dnf_reason
         }
+
+        # Debug: log episode termination
+        if done:
+            reason = dnf_reason if dnf_reason else "lap_complete"
+            print(f"[Episode {self.episode_count}] Ended at step {self.step_count}: {reason} "
+                  f"(dist={S.get('distRaced', 0):.1f}m, speed={S.get('speedX', 0):.1f}km/h)")
 
         # Add lap time info if lap completed
         if self.lap_tracker.lap_just_completed:
@@ -308,17 +323,25 @@ class TorcsRLEnv(gym.Env):
         if self.lap_tracker.lap_count >= self.target_laps:
             return True, None  # Not a DNF, completed successfully
 
+        # Give the car some time to stabilize after race start before checking termination
+        # TORCS may have weird initial values in the first few frames
+        grace_period = 50  # ~1 second of grace period
+        if self.step_count < grace_period:
+            return False, None
+
         # Off track
         track_pos = S.get('trackPos', 0)
         if abs(track_pos) > self.off_track_threshold:
             return True, 'off_track'
 
-        # Facing backward
+        # Facing backward - only check after grace period and with significant speed
+        # to avoid false positives from initial spawn orientation
         angle = S.get('angle', 0)
-        if math.cos(angle) < 0:
+        speed = S.get('speedX', 0)
+        if math.cos(angle) < 0 and speed > 5:  # Only if actually moving backward
             return True, 'facing_backward'
 
-        # Stalled at start
+        # Stalled at start - be more lenient
         if not self.start_check_done and self.step_count >= self.start_check_steps:
             dist_raced = S.get('distRaced', 0)
             if dist_raced < self.start_min_distance:
