@@ -101,9 +101,12 @@ class TorcsRLEnv(gym.Env):
         self.total_reward = 0.0
         self.best_lap_time = None
 
-    def reset(self):
-        """Reset the environment and return initial observation."""
+    def reset(self, seed=None, options=None):
+        """Reset the environment and return initial observation and info."""
         import time
+
+        # Handle seed for gymnasium compatibility
+        super().reset(seed=seed)
 
         # Shutdown previous client if exists
         if self.client is not None:
@@ -140,9 +143,10 @@ class TorcsRLEnv(gym.Env):
         self.start_check_done = False
         self.total_reward = 0.0
 
-        # Return initial observation
+        # Return initial observation and info dict (gymnasium API)
         obs = self._get_observation()
-        return obs
+        info = {}
+        return obs, info
 
     def step(self, action):
         """
@@ -152,7 +156,7 @@ class TorcsRLEnv(gym.Env):
             action: [steering, accel, brake]
 
         Returns:
-            observation, reward, done, info
+            observation, reward, terminated, truncated, info (gymnasium API)
         """
         self.step_count += 1
 
@@ -171,7 +175,7 @@ class TorcsRLEnv(gym.Env):
         # Check if connection closed
         if self.client.so is None or self.client.S.d is None:
             obs = self._get_observation()
-            return obs, -100.0, True, {'dnf': True, 'dnf_reason': 'connection_lost'}
+            return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_lost'}
 
         S = self.client.S.d
 
@@ -183,6 +187,12 @@ class TorcsRLEnv(gym.Env):
 
         # Check termination conditions
         done, dnf_reason = self._check_done(S)
+
+        # Gymnasium uses terminated and truncated instead of done
+        # terminated = episode ended due to environment rules (lap complete, crash, etc.)
+        # truncated = episode ended due to time limit
+        truncated = (dnf_reason == 'max_steps')
+        terminated = done and not truncated
 
         # Calculate reward
         reward = self._calculate_reward(S, done, dnf_reason)
@@ -209,7 +219,7 @@ class TorcsRLEnv(gym.Env):
             if self.best_lap_time is None or self.lap_tracker.last_lap_time < self.best_lap_time:
                 self.best_lap_time = self.lap_tracker.last_lap_time
 
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
     def _get_observation(self):
         """Extract observation vector from server state."""
