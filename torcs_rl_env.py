@@ -174,13 +174,28 @@ class TorcsRLEnv(gym.Env):
         accel = np.clip(action[1], 0.0, 1.0)
         brake = np.clip(action[2], 0.0, 1.0)
 
-        # Launch assist: push car to 150 km/h before giving full control to agent
-        # This ensures the agent starts learning from racing speeds
+        # Get current state
         current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
-        if current_speed < 150:
-            # Force full acceleration and disable braking until 150 km/h
-            accel = 1.0  # Full throttle
-            brake = 0.0  # No braking
+
+        # Steering damping at high speeds to prevent spins
+        # Reduce max steering as speed increases
+        if current_speed > 50:
+            # At 50 km/h: max steer = 1.0, at 150 km/h: max steer = 0.4, at 250 km/h: max steer = 0.2
+            max_steer = max(0.2, 1.0 - (current_speed - 50) / 150)
+            steer = np.clip(steer, -max_steer, max_steer)
+
+        # Launch assist: push car to 150 km/h before giving full control to agent
+        if current_speed < 150 and current_speed >= 0:
+            # Reduce throttle when steering hard to prevent spins
+            steer_factor = 1.0 - abs(steer) * 0.5  # 50% throttle reduction at full steering
+            target_accel = max(0.6, steer_factor)  # At least 60% throttle
+            accel = max(accel, target_accel)
+            brake = 0.0  # No braking during launch
+
+        # If car is going backwards, don't accelerate (let it stop naturally)
+        if current_speed < -5:
+            accel = 0.0
+            brake = 0.5  # Apply some brake to stop
 
         self.client.R.d['steer'] = steer
         self.client.R.d['accel'] = accel
@@ -287,7 +302,8 @@ class TorcsRLEnv(gym.Env):
     def _auto_gear(self):
         """
         Automatic gear shifting with hysteresis to prevent oscillation.
-        Uses different thresholds for upshifting and downshifting.
+        Never uses reverse gear - if car is going backwards, stay in gear 1
+        and let brakes/physics handle it.
         """
         if self.client.S.d is None:
             return 1
@@ -296,9 +312,6 @@ class TorcsRLEnv(gym.Env):
         current_gear = self.client.S.d.get('gear', 1)
 
         # Gear shift thresholds: (upshift_speed, downshift_speed)
-        # Upshift when speed exceeds upshift threshold
-        # Downshift when speed drops below downshift threshold
-        # The gap between them prevents oscillation
         gear_thresholds = {
             1: (55, None),    # Upshift to 2 at 55, no downshift from 1
             2: (85, 45),      # Upshift to 3 at 85, downshift to 1 at 45
@@ -308,12 +321,13 @@ class TorcsRLEnv(gym.Env):
             6: (None, 185),   # No upshift from 6, downshift to 5 at 185
         }
 
-        # Only use reverse if significantly moving backward (not just floating point noise)
-        if speed < -5:
-            return -1
+        # Never use reverse - always stay in gear 1 at low/negative speeds
+        # This prevents the car from accelerating backwards after a spin
+        if speed < 20:
+            return 1
 
-        # At low/zero speed or in reverse/neutral, always use gear 1
-        if current_gear <= 0 or speed < 5:
+        # If somehow in reverse/neutral, go to gear 1
+        if current_gear <= 0:
             return 1
 
         # Clamp to valid gear range
