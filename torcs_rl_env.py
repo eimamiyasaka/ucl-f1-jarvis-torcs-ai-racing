@@ -34,8 +34,8 @@ class TorcsRLEnv(gym.Env):
     metadata = {'render.modes': []}
 
     def __init__(self, port=3001, max_steps=15000, target_laps=1,
-                 off_track_threshold=1.3, start_min_distance=25,
-                 start_check_steps=250, reward_type='progress'):
+                 off_track_threshold=1.3, start_min_distance=10,
+                 start_check_steps=500, reward_type='progress'):
         """
         Initialize TORCS RL environment.
 
@@ -175,13 +175,12 @@ class TorcsRLEnv(gym.Env):
         brake = np.clip(action[2], 0.0, 1.0)
 
         # Launch assist: help the car get moving from standstill
-        # In the first 100 steps, if speed is very low, boost acceleration
-        # and suppress braking to ensure the car actually moves
+        # Suppress braking at low speeds to let the car build momentum
         current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
-        if self.step_count < 100 and current_speed < 30:
-            # Force acceleration and disable brake at low speeds
-            accel = max(accel, 0.8)  # Ensure at least 80% throttle
-            brake = 0.0  # No braking when trying to launch
+        if current_speed < 50:
+            # At low speeds, boost acceleration and reduce braking
+            accel = max(accel, 0.5)  # Ensure at least 50% throttle
+            brake = brake * 0.2  # Reduce brake effectiveness to 20%
 
         self.client.R.d['steer'] = steer
         self.client.R.d['accel'] = accel
