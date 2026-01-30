@@ -190,9 +190,20 @@ class TorcsRLEnv(gym.Env):
         # Simple automatic gear shifting
         self.client.R.d['gear'] = self._auto_gear()
 
+        # Debug: print actions every 50 steps
+        if self.step_count % 50 == 1:
+            print(f"  [Step {self.step_count}] Actions: accel={accel:.2f}, brake={brake:.2f}, "
+                  f"steer={steer:.2f}, gear={self.client.R.d['gear']}")
+
         # Send action and get response
         self.client.respond_to_server()
         self.client.get_servers_input()
+
+        # Debug: print state every 50 steps
+        if self.step_count % 50 == 1 and self.client.S.d:
+            S = self.client.S.d
+            print(f"  [Step {self.step_count}] State: speed={S.get('speedX', 0):.1f}, "
+                  f"dist={S.get('distRaced', 0):.1f}, gear={S.get('gear', 0)}")
 
         # Check if connection closed
         if self.client.so is None or self.client.S.d is None:
@@ -298,11 +309,12 @@ class TorcsRLEnv(gym.Env):
             6: (None, 185),   # No upshift from 6, downshift to 5 at 185
         }
 
-        if speed < 0:
+        # Only use reverse if significantly moving backward (not just floating point noise)
+        if speed < -5:
             return -1
 
-        # Handle reverse or neutral
-        if current_gear <= 0:
+        # At low/zero speed or in reverse/neutral, always use gear 1
+        if current_gear <= 0 or speed < 5:
             return 1
 
         # Clamp to valid gear range
