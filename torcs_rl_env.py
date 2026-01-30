@@ -174,13 +174,13 @@ class TorcsRLEnv(gym.Env):
         accel = np.clip(action[1], 0.0, 1.0)
         brake = np.clip(action[2], 0.0, 1.0)
 
-        # Launch assist: help the car get moving from standstill
-        # Suppress braking at low speeds to let the car build momentum
+        # Launch assist: push car to 150 km/h before giving full control to agent
+        # This ensures the agent starts learning from racing speeds
         current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
-        if current_speed < 50:
-            # At low speeds, boost acceleration and reduce braking
-            accel = max(accel, 0.5)  # Ensure at least 50% throttle
-            brake = brake * 0.2  # Reduce brake effectiveness to 20%
+        if current_speed < 150:
+            # Force full acceleration and disable braking until 150 km/h
+            accel = 1.0  # Full throttle
+            brake = 0.0  # No braking
 
         self.client.R.d['steer'] = steer
         self.client.R.d['accel'] = accel
