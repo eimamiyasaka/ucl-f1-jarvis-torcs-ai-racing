@@ -34,7 +34,7 @@ class TorcsRLEnv(gym.Env):
     metadata = {'render.modes': []}
 
     def __init__(self, port=3001, max_steps=15000, target_laps=1,
-                 off_track_threshold=1.3, start_min_distance=10,
+                 off_track_threshold=1.5, start_min_distance=10,
                  start_check_steps=500, reward_type='progress'):
         """
         Initialize TORCS RL environment.
@@ -253,11 +253,6 @@ class TorcsRLEnv(gym.Env):
         # Simple automatic gear shifting
         self.client.R.d['gear'] = self._auto_gear()
 
-        # Debug: print actions every 50 steps
-        if self.step_count % 50 == 1:
-            print(f"  [Step {self.step_count}] Actions: accel={accel:.2f}, brake={brake:.2f}, "
-                  f"steer={steer:.2f}, gear={self.client.R.d['gear']}")
-
         # Send action and get response with failure tracking
         send_success = self.client.respond_to_server()
         if not send_success:
@@ -276,12 +271,6 @@ class TorcsRLEnv(gym.Env):
                 return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_timeout'}
         else:
             self.consecutive_failures = 0  # Reset on success
-
-        # Debug: print state every 50 steps
-        if self.step_count % 50 == 1 and self.client.S.d:
-            S = self.client.S.d
-            print(f"  [Step {self.step_count}] State: speed={S.get('speedX', 0):.1f}, "
-                  f"dist={S.get('distRaced', 0):.1f}, gear={S.get('gear', 0)}")
 
         # Check if connection closed
         if self.client.so is None or self.client.S.d is None:
@@ -326,7 +315,7 @@ class TorcsRLEnv(gym.Env):
         if done:
             reason = dnf_reason if dnf_reason else "lap_complete"
             print(f"[Episode {self.episode_count}] Ended at step {self.step_count}: {reason} "
-                  f"(dist={S.get('distRaced', 0):.1f}m, speed={S.get('speedX', 0):.1f}km/h)")
+                  f"(dist={S.get('distRaced', 0):.1f}m, reward={self.total_reward:.1f})")
 
         # Add lap time info if lap completed
         if self.lap_tracker.lap_just_completed:
@@ -500,10 +489,15 @@ class TorcsRLEnv(gym.Env):
 
             # 4. Angle penalty (face forward) - scaled down
             # Angle in radians, typically < 0.5 for normal driving
-            angle_penalty = -abs(angle) * 0.1
+            angle_penalty = -angle * 0.1  # angle is already abs() from line 480
             reward += angle_penalty
 
-            # 5. Lap completion bonus
+            # 5. Survival bonus - small reward for staying on track and moving
+            # Encourages conservative driving early in training
+            if speed > 10 and track_pos < 1.0:
+                reward += 0.05
+
+            # 6. Lap completion bonus
             # Reduced to be more balanced with per-step rewards
             # With ~15000 steps/episode and ~1.0 per-step reward, total ~15000
             # Lap bonus should be meaningful but not dominate (~2-5% of total)
@@ -515,10 +509,10 @@ class TorcsRLEnv(gym.Env):
                 lap_bonus = min(lap_bonus, 60.0)
                 reward += lap_bonus
 
-            # 6. DNF penalty - scaled to be comparable to missing a lap bonus
+            # 7. DNF penalty - scaled to be comparable to missing a lap bonus
             if done and dnf_reason is not None:
                 # Penalty based on progress made - less penalty if close to finishing
-                progress_fraction = min(dist_raced / 5000.0, 1.0)  # Assume ~5km track
+                progress_fraction = min(dist_raced / 3610.0, 1.0)  # Corkscrew track is 3.608km
                 if dnf_reason == 'off_track':
                     reward -= 20.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'facing_backward':
