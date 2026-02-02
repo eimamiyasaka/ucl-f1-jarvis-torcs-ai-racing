@@ -27,12 +27,15 @@ class LapTimeCallback(BaseCallback):
     Stops training when target lap time is achieved.
     """
 
+    MAX_LAP_HISTORY = 1000  # Maximum lap times to keep in memory
+
     def __init__(self, target_lap_time=None, verbose=1):
         super(LapTimeCallback, self).__init__(verbose)
         self.target_lap_time = target_lap_time
         self.best_lap_time = None
         self.episode_lap_times = []
         self.episode_count = 0
+        self.total_laps_completed = 0  # Track total even after trimming list
 
     def _on_step(self) -> bool:
         # Access info from the environment
@@ -44,6 +47,11 @@ class LapTimeCallback(BaseCallback):
             if 'lap_time' in info:
                 lap_time = info['lap_time']
                 self.episode_lap_times.append(lap_time)
+                self.total_laps_completed += 1
+
+                # Prevent unbounded memory growth - keep only recent laps
+                if len(self.episode_lap_times) > self.MAX_LAP_HISTORY:
+                    self.episode_lap_times = self.episode_lap_times[-self.MAX_LAP_HISTORY:]
 
                 # Update best lap time
                 if self.best_lap_time is None or lap_time < self.best_lap_time:
@@ -91,10 +99,10 @@ class LapTimeCallback(BaseCallback):
             print(f"Total timesteps: {self.num_timesteps}")
             if self.best_lap_time is not None:
                 print(f"Best lap time: {self.best_lap_time:.3f}s")
-            print(f"Total laps completed: {len(self.episode_lap_times)}")
+            print(f"Total laps completed: {self.total_laps_completed}")
             if self.episode_lap_times:
-                print(f"Average lap time: {np.mean(self.episode_lap_times):.3f}s")
-                print(f"Lap time std: {np.std(self.episode_lap_times):.3f}s")
+                print(f"Recent {len(self.episode_lap_times)} laps average: {np.mean(self.episode_lap_times):.3f}s")
+                print(f"Recent laps std: {np.std(self.episode_lap_times):.3f}s")
             print(f"{'='*60}\n")
 
 
@@ -349,7 +357,7 @@ def train_ppo(
         print(f"TRAINING COMPLETED")
         print(f"{'='*60}")
         print(f"Best lap time achieved: {lap_time_callback.best_lap_time:.3f}s")
-        print(f"Total laps completed: {len(lap_time_callback.episode_lap_times)}")
+        print(f"Total laps completed: {lap_time_callback.total_laps_completed}")
         if lap_time_callback.episode_lap_times:
             recent_laps = lap_time_callback.episode_lap_times[-10:]
             print(f"Recent 10 laps average: {np.mean(recent_laps):.3f}s")
@@ -500,7 +508,7 @@ def resume_training(
         print(f"RESUMED TRAINING COMPLETED")
         print(f"{'='*60}")
         print(f"Best lap time achieved: {lap_time_callback.best_lap_time:.3f}s")
-        print(f"Total laps completed: {len(lap_time_callback.episode_lap_times)}")
+        print(f"Total laps completed: {lap_time_callback.total_laps_completed}")
         print(f"{'='*60}\n")
 
     env.close()

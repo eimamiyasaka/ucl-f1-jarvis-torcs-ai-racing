@@ -44,13 +44,18 @@ def test_environment(port=3001):
         print(f"Action space: {env.action_space.shape}")
 
         print("\nTesting reset...")
-        obs = env.reset()
+        obs, info = env.reset()
+        if info.get('connection_failed', False):
+            print("✗ Reset failed - connection issue")
+            env.close()
+            return False
         print(f"✓ Reset successful, obs shape: {obs.shape}")
 
         print("\nTesting 10 random steps...")
         for i in range(10):
             action = env.action_space.sample()
-            obs, reward, done, info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
             print(f"  Step {i+1}: speed={obs[0]:.1f} km/h, reward={reward:.2f}")
             if done:
                 print(f"  Episode ended: {info.get('dnf_reason', 'completed')}")

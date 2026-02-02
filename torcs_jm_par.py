@@ -97,9 +97,9 @@ class Client():
             sys.exit(-1)
         self.so.settimeout(1)
 
-        # More patient connection logic for RL training
-        # TORCS needs time after race restart before scr_server is ready
-        n_fail = 15  # Wait up to ~15 seconds before considering restart
+        # Patient connection logic - TORCS needs time after race restart
+        # Each retry is ~1 second, so n_fail=30 means wait up to 30 seconds
+        n_fail = 30  # Wait up to ~30 seconds before considering restart
         max_restart_attempts = 3
         restart_attempts = 0
 
@@ -159,7 +159,7 @@ class Client():
                             os.system('sh autostart.sh')
 
                     time.sleep(3.0)  # Give TORCS time to start
-                    n_fail = 15  # Reset countdown
+                    n_fail = 30  # Reset countdown
                 n_fail -= 1
 
             identify = '***identified***'
@@ -208,48 +208,76 @@ class Client():
             print('Superflous input? %s\n%s' % (', '.join(args), usage))
             sys.exit(-1)
 
-    def get_servers_input(self):
-        '''Server's input is stored in a ServerState object'''
-        if not self.so: return
-        sockdata= str()
+    def get_servers_input(self, max_retries=30):
+        '''Server's input is stored in a ServerState object.
 
-        while True:
+        Args:
+            max_retries: Maximum number of timeout retries before giving up (default 30 = ~30 seconds)
+
+        Returns:
+            bool: True if data was received successfully, False if connection failed
+        '''
+        if not self.so: return False
+        sockdata= str()
+        retry_count = 0
+
+        while retry_count < max_retries:
             try:
                 sockdata,addr= self.so.recvfrom(data_size)
                 sockdata = sockdata.decode('utf-8')
+                retry_count = 0  # Reset on successful receive
             except socket.error as emsg:
-                print('.', end=' ')
+                retry_count += 1
+                if retry_count % 5 == 0:  # Print less frequently
+                    print(f'. (retry {retry_count}/{max_retries})', end=' ', flush=True)
+                if retry_count >= max_retries:
+                    print(f"\nConnection timeout after {max_retries} retries on port {self.port}")
+                    self.shutdown()
+                    return False
+                continue
             if '***identified***' in sockdata:
                 print("Client connected on %d.............." % self.port)
                 continue
             elif '***shutdown***' in sockdata:
                 print((("Server has stopped the race on %d. "+
                         "You were in %d place.") %
-                        (self.port,self.S.d['racePos'])))
+                        (self.port,self.S.d.get('racePos', 0))))
                 self.shutdown()
-                return
+                return False
             elif '***restart***' in sockdata:
                 print("Server has restarted the race on %d." % self.port)
                 self.shutdown()
-                return
+                return False
             elif not sockdata: # Empty?
+                retry_count += 1
                 continue       # Try again.
             else:
                 self.S.parse_server_str(sockdata)
                 if self.debug:
                     sys.stderr.write("\x1b[2J\x1b[H") # Clear for steady output.
                     print(self.S)
-                break # Can now return from this function.
+                return True  # Success
+
+        print(f"\nMax retries exceeded on port {self.port}")
+        self.shutdown()
+        return False
 
     def respond_to_server(self):
-        if not self.so: return
+        '''Send driver action to server.
+
+        Returns:
+            bool: True if send was successful, False if connection failed
+        '''
+        if not self.so: return False
         try:
             message = repr(self.R)
             self.so.sendto(message.encode(), (self.host, self.port))
         except socket.error as emsg:
-            print("Error sending to server: %s Message %s" % (emsg[1],str(emsg[0])))
-            sys.exit(-1)
+            print("Error sending to server: %s" % str(emsg))
+            self.shutdown()
+            return False
         if self.debug: print(self.R.fancyout())
+        return True
 
     def shutdown(self):
         if not self.so: return
@@ -930,6 +958,8 @@ class LapTimeTracker:
                 print(f"Lap {tracker.lap_count}: {tracker.last_lap_time:.3f}s")
     """
 
+    MAX_LAP_HISTORY = 100  # Maximum number of lap times to keep in memory
+
     def __init__(self, track_length=None):
         self.track_length = track_length  # Optional: set if known
         self.lap_count = 0
@@ -1000,6 +1030,10 @@ class LapTimeTracker:
         self.last_lap_time = lap_time
         self.lap_times.append(lap_time)
         self.lap_just_completed = True
+
+        # Prevent unbounded memory growth - keep only recent laps
+        if len(self.lap_times) > self.MAX_LAP_HISTORY:
+            self.lap_times = self.lap_times[-self.MAX_LAP_HISTORY:]
 
         if self.best_lap_time is None or lap_time < self.best_lap_time:
             self.best_lap_time = lap_time

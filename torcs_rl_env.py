@@ -100,42 +100,58 @@ class TorcsRLEnv(gym.Env):
         self.start_check_done = False
         self.total_reward = 0.0
         self.best_lap_time = None
+        self.connection_healthy = False  # Track connection health
+        self.consecutive_failures = 0  # Track consecutive communication failures
+        self.max_consecutive_failures = 5  # Max failures before episode termination
 
     def reset(self, seed=None, options=None):
         """Reset the environment and return initial observation and info."""
-        import time
 
         # Handle seed for gymnasium compatibility
         super().reset(seed=seed)
 
-        # Shutdown previous client if exists
+        # Properly shutdown previous client if exists
         if self.client is not None:
-            try:
-                self.client.restart_race()
-            except:
-                pass
-            # Wait for TORCS to fully process the restart request
-            # TORCS needs several seconds to reload the race
-            time.sleep(2.0)
+            self._cleanup_client()
 
         # Create new client connection with retry logic
-        max_retries = 5
-        for attempt in range(max_retries):
+        max_connection_attempts = 3
+        for attempt in range(max_connection_attempts):
             try:
+                # The Client class handles waiting for server in setup_connection()
                 self.client = Client(p=self.port)
                 self.client.maxSteps = self.max_steps
+                self.connection_healthy = True
+                self.consecutive_failures = 0
                 break
             except Exception as e:
-                if attempt < max_retries - 1:
-                    print(f"Connection attempt {attempt + 1} failed, retrying...")
-                    time.sleep(1.0)
-                else:
-                    raise RuntimeError(f"Failed to connect to TORCS after {max_retries} attempts: {e}")
+                print(f"[Episode {self.episode_count + 1}] Connection attempt {attempt + 1}/{max_connection_attempts} failed: {e}")
+                if attempt == max_connection_attempts - 1:
+                    print(f"Failed to connect after {max_connection_attempts} attempts")
+                    self.connection_healthy = False
+                    # Return zero observation with connection failure flag
+                    # Mark as terminated so training loop handles this like a DNF
+                    obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+                    return obs, {
+                        'connection_failed': True,
+                        'dnf': True,
+                        'dnf_reason': 'connection_failed',
+                        'terminal_reward': -100.0  # Signal penalty to training loop
+                    }
 
         self.lap_tracker = LapTimeTracker()
 
-        # Get initial state
-        self.client.get_servers_input()
+        # Get initial state with timeout handling
+        if not self.client.get_servers_input(max_retries=10):
+            print(f"[Episode {self.episode_count + 1}] Failed to get initial server state")
+            self.connection_healthy = False
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            return obs, {
+                'connection_failed': True,
+                'dnf': True,
+                'dnf_reason': 'connection_failed',
+                'terminal_reward': -100.0  # Signal penalty to training loop
+            }
 
         # Reset episode tracking
         self.step_count = 0
@@ -157,6 +173,34 @@ class TorcsRLEnv(gym.Env):
         info = {}
         return obs, info
 
+    def _cleanup_client(self):
+        """Properly cleanup client connection and request race restart."""
+        import time
+
+        if self.client is None:
+            return
+
+        try:
+            # Try to request race restart first
+            self.client.restart_race()
+        except Exception as e:
+            print(f"Warning: restart_race failed: {e}")
+
+        # Ensure socket is closed even if restart_race failed
+        try:
+            if self.client.so is not None:
+                self.client.so.close()
+                self.client.so = None
+        except Exception as e:
+            print(f"Warning: socket close failed: {e}")
+
+        self.client = None
+
+        # Give TORCS time to process the restart before reconnecting
+        # This is crucial - without this delay, rapid episode resets can
+        # overwhelm TORCS's restart mechanism
+        time.sleep(1.0)
+
     def step(self, action):
         """
         Execute one step in the environment.
@@ -168,6 +212,11 @@ class TorcsRLEnv(gym.Env):
             observation, reward, terminated, truncated, info (gymnasium API)
         """
         self.step_count += 1
+
+        # Check if connection is healthy before proceeding
+        if not self.connection_healthy or self.client is None or self.client.so is None:
+            obs = self._get_observation()
+            return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_lost'}
 
         # Apply action
         steer = np.clip(action[0], -1.0, 1.0)
@@ -209,9 +258,24 @@ class TorcsRLEnv(gym.Env):
             print(f"  [Step {self.step_count}] Actions: accel={accel:.2f}, brake={brake:.2f}, "
                   f"steer={steer:.2f}, gear={self.client.R.d['gear']}")
 
-        # Send action and get response
-        self.client.respond_to_server()
-        self.client.get_servers_input()
+        # Send action and get response with failure tracking
+        send_success = self.client.respond_to_server()
+        if not send_success:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.connection_healthy = False
+                obs = self._get_observation()
+                return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_lost'}
+
+        recv_success = self.client.get_servers_input(max_retries=10)
+        if not recv_success:
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.connection_healthy = False
+                obs = self._get_observation()
+                return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_timeout'}
+        else:
+            self.consecutive_failures = 0  # Reset on success
 
         # Debug: print state every 50 steps
         if self.step_count % 50 == 1 and self.client.S.d:
@@ -221,6 +285,7 @@ class TorcsRLEnv(gym.Env):
 
         # Check if connection closed
         if self.client.so is None or self.client.S.d is None:
+            self.connection_healthy = False
             obs = self._get_observation()
             return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_lost'}
 
@@ -363,7 +428,8 @@ class TorcsRLEnv(gym.Env):
 
         # Give the car some time to stabilize after race start before checking termination
         # TORCS may have weird initial values in the first few frames
-        grace_period = 50  # ~1 second of grace period
+        # Car needs ~2-3 seconds to reach 150 km/h with launch assist
+        grace_period = 150  # ~3 seconds of grace period at 50 FPS
         if self.step_count < grace_period:
             return False, None
 
@@ -416,14 +482,14 @@ class TorcsRLEnv(gym.Env):
         if self.reward_type == 'progress':
             # 1. Progress reward (main driver)
             # Reward distance traveled - typically 0-5m per step at high speed
-            # Scale to give ~0.1-0.5 reward per step
+            # Increased scale for better balance with terminal rewards
             dist_progress = dist_raced - self.prev_dist_raced
-            reward += dist_progress * 0.1
+            reward += dist_progress * 0.2
 
             # 2. Speed bonus (encourage maintaining high speed)
-            # Normalized speed reward (0 to 0.3 for speeds 0 to 300 km/h)
+            # Increased scale: 0 to 0.5 for speeds 0 to 300 km/h
             speed_normalized = np.clip(speed / 300.0, 0, 1)
-            reward += speed_normalized * 0.3
+            reward += speed_normalized * 0.5
 
             # 3. Track position penalty (stay near center, but allow some deviation)
             # Softer penalty - only significant when far from center
@@ -438,13 +504,15 @@ class TorcsRLEnv(gym.Env):
             reward += angle_penalty
 
             # 5. Lap completion bonus
+            # Reduced to be more balanced with per-step rewards
+            # With ~15000 steps/episode and ~1.0 per-step reward, total ~15000
+            # Lap bonus should be meaningful but not dominate (~2-5% of total)
             if self.lap_tracker.lap_just_completed:
-                # Bonus scaled based on lap time quality
-                # Target: ~60s lap = 50 bonus, ~90s lap = 33 bonus, ~120s lap = 25 bonus
+                # Target: ~60s lap = 40 bonus, ~90s lap = 27 bonus, ~120s lap = 20 bonus
                 lap_time = self.lap_tracker.last_lap_time
-                lap_bonus = 50.0 * (60.0 / max(lap_time, 30.0))
+                lap_bonus = 40.0 * (60.0 / max(lap_time, 30.0))
                 # Cap the bonus to prevent extreme values
-                lap_bonus = min(lap_bonus, 100.0)
+                lap_bonus = min(lap_bonus, 60.0)
                 reward += lap_bonus
 
             # 6. DNF penalty - scaled to be comparable to missing a lap bonus
@@ -452,14 +520,14 @@ class TorcsRLEnv(gym.Env):
                 # Penalty based on progress made - less penalty if close to finishing
                 progress_fraction = min(dist_raced / 5000.0, 1.0)  # Assume ~5km track
                 if dnf_reason == 'off_track':
-                    reward -= 30.0 * (1.0 - 0.5 * progress_fraction)
+                    reward -= 20.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'facing_backward':
-                    reward -= 30.0 * (1.0 - 0.5 * progress_fraction)
+                    reward -= 20.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'stalled_start':
-                    reward -= 50.0  # Harsh penalty for not even starting
+                    reward -= 30.0  # Penalty for not even starting
                 elif dnf_reason == 'max_steps':
                     # Mild penalty - agent was trying but too slow
-                    reward -= 10.0
+                    reward -= 5.0
 
         elif self.reward_type == 'time':
             # Alternative: sparse reward based on lap time
@@ -486,9 +554,16 @@ class TorcsRLEnv(gym.Env):
 
     def close(self):
         """Clean up environment."""
+        self.connection_healthy = False
         if self.client is not None:
             try:
                 self.client.shutdown()
+            except Exception as e:
+                print(f"Warning: shutdown failed: {e}")
+            # Ensure socket is closed
+            try:
+                if self.client.so is not None:
+                    self.client.so.close()
             except:
                 pass
             self.client = None
@@ -530,7 +605,7 @@ class TorcsRLEnvVec:
         """Reset all environments."""
         obs_list = []
         for env in self.envs:
-            obs = env.reset()
+            obs, info = env.reset()
             obs_list.append(obs)
         return np.array(obs_list)
 
@@ -546,14 +621,18 @@ class TorcsRLEnvVec:
         infos = []
 
         for i, (env, action) in enumerate(zip(self.envs, actions)):
-            obs, reward, done, info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
             # Auto-reset on episode end
             if done:
                 # Store terminal observation in info for algorithms that need it
                 info['terminal_observation'] = obs
                 # Reset and get new initial observation
-                obs = env.reset()
+                obs, reset_info = env.reset()
+                # Check if reset failed due to connection issues
+                if reset_info.get('connection_failed', False):
+                    info['connection_failed'] = True
 
             obs_list.append(obs)
             rewards.append(reward)
@@ -591,16 +670,20 @@ if __name__ == "__main__":
 
     # Test reset
     print("Resetting environment...")
-    obs = env.reset()
-    print(f"Initial observation shape: {obs.shape}")
-    print(f"Initial speed: {obs[0]:.2f} km/h")
+    obs, info = env.reset()
+    if info.get('connection_failed', False):
+        print("Connection failed during reset!")
+    else:
+        print(f"Initial observation shape: {obs.shape}")
+        print(f"Initial speed: {obs[0]:.2f} km/h")
     print("=" * 60)
 
     # Test random actions for a few steps
     print("Testing random actions...")
     for i in range(10):
         action = env.action_space.sample()
-        obs, reward, done, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
         print(f"Step {i+1}: speed={obs[0]:.1f}, reward={reward:.2f}, done={done}")
 
         if done:
