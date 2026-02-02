@@ -234,13 +234,24 @@ class TorcsRLEnv(gym.Env):
             steer = np.clip(steer, -max_steer, max_steer)
 
         # Launch assist: push car to 150 km/h before giving full control to agent
-        if current_speed < 150 and current_speed >= 0:
-            # Limit steering during launch to prevent early spins
-            steer = np.clip(steer, -0.3, 0.3)
+        # Note: allow small negative speeds (car may report -0.0 at standstill)
+        if current_speed < 150 and current_speed >= -5:
+            # Progressive steering limit: heavily restricted during launch
+            # 0 km/h: 0.03, 50 km/h: 0.05, 100 km/h: 0.07, 150 km/h: 0.09
+            speed_factor = max(0, current_speed) / 150.0
+            launch_max_steer = 0.03 + speed_factor * 0.06
+            original_steer = steer
+            steer = np.clip(steer, -launch_max_steer, launch_max_steer)
             # Reduce throttle when steering hard to prevent spins
-            steer_factor = 1.0 - abs(steer) * 0.5  # 50% throttle reduction at full steering
-            target_accel = max(0.6, steer_factor)  # At least 60% throttle
-            accel = max(accel, target_accel)
+            # steer_factor: 1.0 at zero steer, 0.5 at max steer (0.35)
+            steer_factor = 1.0 - abs(steer) * 1.4  # ~50% reduction at max launch steering
+            target_accel = np.clip(steer_factor, 0.6, 1.0)  # Clamp between 60% and 100%
+            original_accel = accel
+            accel = target_accel  # Override agent throttle during launch
+            if self.step_count <= 5:
+                print(f"  [Launch] Step {self.step_count}: speed={current_speed:.1f}, "
+                      f"max_steer={launch_max_steer:.2f}, steer {original_steer:.2f} -> {steer:.2f}, "
+                      f"accel {original_accel:.2f} -> {accel:.2f}")
             brake = 0.0  # No braking during launch
 
         # If car is going backwards, don't accelerate (let it stop naturally)
