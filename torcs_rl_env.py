@@ -235,6 +235,8 @@ class TorcsRLEnv(gym.Env):
 
         # Launch assist: push car to 150 km/h before giving full control to agent
         if current_speed < 150 and current_speed >= 0:
+            # Limit steering during launch to prevent early spins
+            steer = np.clip(steer, -0.3, 0.3)
             # Reduce throttle when steering hard to prevent spins
             steer_factor = 1.0 - abs(steer) * 0.5  # 50% throttle reduction at full steering
             target_accel = max(0.6, steer_factor)  # At least 60% throttle
@@ -498,15 +500,15 @@ class TorcsRLEnv(gym.Env):
                 reward += 0.05
 
             # 6. Lap completion bonus
-            # Reduced to be more balanced with per-step rewards
-            # With ~15000 steps/episode and ~1.0 per-step reward, total ~15000
-            # Lap bonus should be meaningful but not dominate (~2-5% of total)
+            # Primary reward signal - completing a lap is the main goal
+            # Base bonus for completion + time-scaled bonus for faster laps
             if self.lap_tracker.lap_just_completed:
-                # Target: ~60s lap = 40 bonus, ~90s lap = 27 bonus, ~120s lap = 20 bonus
                 lap_time = self.lap_tracker.last_lap_time
-                lap_bonus = 40.0 * (60.0 / max(lap_time, 30.0))
-                # Cap the bonus to prevent extreme values
-                lap_bonus = min(lap_bonus, 60.0)
+                # Base bonus: 750 points just for finishing
+                # Time bonus: 750 * (60/lap_time) - rewards faster completion
+                base_bonus = 750.0
+                time_bonus = 750.0 * (60.0 / max(lap_time, 30.0))
+                lap_bonus = base_bonus + time_bonus
                 reward += lap_bonus
 
             # 7. DNF penalty - scaled to be comparable to missing a lap bonus
