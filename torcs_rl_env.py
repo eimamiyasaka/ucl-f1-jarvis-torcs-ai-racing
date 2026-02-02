@@ -35,7 +35,8 @@ class TorcsRLEnv(gym.Env):
 
     def __init__(self, port=3001, max_steps=15000, target_laps=1,
                  off_track_threshold=1.5, start_min_distance=10,
-                 start_check_steps=500, reward_type='progress'):
+                 start_check_steps=500, reward_type='progress',
+                 launch_assist=True):
         """
         Initialize TORCS RL environment.
 
@@ -47,6 +48,7 @@ class TorcsRLEnv(gym.Env):
             start_min_distance: Minimum distance to travel in start_check_steps
             start_check_steps: Steps to check for stalled start
             reward_type: 'progress' or 'time' - reward shaping strategy
+            launch_assist: Enable launch assist (restricts steering at low speeds)
         """
         super(TorcsRLEnv, self).__init__()
 
@@ -57,6 +59,7 @@ class TorcsRLEnv(gym.Env):
         self.start_min_distance = start_min_distance
         self.start_check_steps = start_check_steps
         self.reward_type = reward_type
+        self.launch_assist_enabled = launch_assist
 
         # Define action space: [steering, accel, brake]
         self.action_space = spaces.Box(
@@ -235,7 +238,7 @@ class TorcsRLEnv(gym.Env):
 
         # Launch assist: push car to 150 km/h before giving full control to agent
         # Note: allow small negative speeds (car may report -0.0 at standstill)
-        if current_speed < 150 and current_speed >= -5:
+        if self.launch_assist_enabled and current_speed < 150 and current_speed >= -5:
             # Progressive steering limit: heavily restricted during launch
             # 0 km/h: 0.03, 50 km/h: 0.05, 100 km/h: 0.07, 150 km/h: 0.09
             speed_factor = max(0, current_speed) / 150.0
@@ -248,10 +251,11 @@ class TorcsRLEnv(gym.Env):
             target_accel = np.clip(steer_factor, 0.6, 1.0)  # Clamp between 60% and 100%
             original_accel = accel
             accel = target_accel  # Override agent throttle during launch
-            if self.step_count <= 5:
-                print(f"  [Launch] Step {self.step_count}: speed={current_speed:.1f}, "
-                      f"max_steer={launch_max_steer:.2f}, steer {original_steer:.2f} -> {steer:.2f}, "
-                      f"accel {original_accel:.2f} -> {accel:.2f}")
+            # previously used debug
+            # if self.step_count <= 5:
+            #     print(f"  [Launch] Step {self.step_count}: speed={current_speed:.1f}, "
+            #           f"max_steer={launch_max_steer:.2f}, steer {original_steer:.2f} -> {steer:.2f}, "
+            #           f"accel {original_accel:.2f} -> {accel:.2f}")
             brake = 0.0  # No braking during launch
 
         # If car is going backwards, don't accelerate (let it stop naturally)
