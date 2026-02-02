@@ -54,16 +54,23 @@ class DemonstrationRecorder:
 
     def get_keyboard_action(self):
         """Read keyboard state and return action."""
-        # Steering
-        left = keyboard.is_pressed('a') or keyboard.is_pressed('left')
-        right = keyboard.is_pressed('d') or keyboard.is_pressed('right')
+        # Steering - check each key individually to avoid state issues
+        left_a = keyboard.is_pressed('a')
+        left_arrow = keyboard.is_pressed('left')
+        right_d = keyboard.is_pressed('d')
+        right_arrow = keyboard.is_pressed('right')
 
+        left = left_a or left_arrow
+        right = right_d or right_arrow
+
+        # In TORCS: negative steer = turn RIGHT, positive steer = turn LEFT
+        # So: left key → positive steer, right key → negative steer
         if left and not right:
-            self.steer = max(-self.max_steer, self.steer - self.steer_speed)
-        elif right and not left:
             self.steer = min(self.max_steer, self.steer + self.steer_speed)
+        elif right and not left:
+            self.steer = max(-self.max_steer, self.steer - self.steer_speed)
         else:
-            # Return to center
+            # Return to center when no steering keys pressed
             if abs(self.steer) < self.steer_return:
                 self.steer = 0.0
             elif self.steer > 0:
