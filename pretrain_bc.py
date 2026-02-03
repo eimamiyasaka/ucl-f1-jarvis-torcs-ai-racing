@@ -17,7 +17,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from torcs_rl_env import TorcsRLEnv
 
 
 class DemonstrationDataset:
@@ -32,14 +31,23 @@ class DemonstrationDataset:
         print(f"  Observation shape: {self.observations.shape}")
         print(f"  Action shape: {self.actions.shape}")
 
+        # Load metadata if available
+        if 'lap_times' in data:
+            lap_times = data['lap_times']
+            if len(lap_times) > 0:
+                print(f"  Source: {len(lap_times)} laps, avg {np.mean(lap_times):.3f}s")
+
         # Basic stats
         print(f"\nAction statistics:")
         print(f"  Steering: mean={self.actions[:, 0].mean():.3f}, "
-              f"std={self.actions[:, 0].std():.3f}")
+              f"std={self.actions[:, 0].std():.3f}, "
+              f"range=[{self.actions[:, 0].min():.3f}, {self.actions[:, 0].max():.3f}]")
         print(f"  Accel:    mean={self.actions[:, 1].mean():.3f}, "
-              f"std={self.actions[:, 1].std():.3f}")
+              f"std={self.actions[:, 1].std():.3f}, "
+              f"range=[{self.actions[:, 1].min():.3f}, {self.actions[:, 1].max():.3f}]")
         print(f"  Brake:    mean={self.actions[:, 2].mean():.3f}, "
-              f"std={self.actions[:, 2].std():.3f}")
+              f"std={self.actions[:, 2].std():.3f}, "
+              f"range=[{self.actions[:, 2].min():.3f}, {self.actions[:, 2].max():.3f}]")
 
     def get_tensors(self):
         """Return PyTorch tensors."""
@@ -94,12 +102,46 @@ def pretrain_ppo_policy(demo_path, output_dir, epochs=100, batch_size=64,
     train_dataset = TensorDataset(train_obs, train_act)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    # Create a dummy environment to initialize PPO with correct spaces
-    def make_dummy_env():
-        return TorcsRLEnv(port=3001, max_steps=100)
+    # Create a dummy environment with matching spaces (no TORCS connection needed)
+    from gymnasium import spaces
+    import gymnasium as gym
 
-    # We don't actually connect - just need the spaces
-    dummy_env = DummyVecEnv([make_dummy_env])
+    class DummyTorcsEnv(gym.Env):
+        """Dummy env with same spaces as TorcsRLEnv - no TORCS needed."""
+        def __init__(self):
+            super().__init__()
+            # Action space: [steering, accel, brake]
+            self.action_space = spaces.Box(
+                low=np.array([-1.0, 0.0, 0.0]),
+                high=np.array([1.0, 1.0, 1.0]),
+                dtype=np.float32
+            )
+            # Observation space: 30 dimensions
+            obs_high = np.array([
+                350.0, 50.0, 50.0,  # speedX, speedY, speedZ
+                np.pi,  # angle
+                2.0,  # trackPos
+                *([200.0] * 19),  # track sensors
+                10000.0,  # rpm
+                6.0,  # gear
+                100.0, 100.0, 100.0, 100.0  # wheelSpinVel
+            ], dtype=np.float32)
+            obs_low = np.array([
+                -50.0, -50.0, -50.0,
+                -np.pi, -2.0,
+                *([0.0] * 19),
+                0.0, -1.0,
+                0.0, 0.0, 0.0, 0.0
+            ], dtype=np.float32)
+            self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+
+        def reset(self, seed=None, options=None):
+            return np.zeros(30, dtype=np.float32), {}
+
+        def step(self, action):
+            return np.zeros(30, dtype=np.float32), 0.0, True, False, {}
+
+    dummy_env = DummyVecEnv([lambda: DummyTorcsEnv()])
 
     # Create PPO model with same architecture as training
     print("\nCreating PPO model...")
@@ -133,7 +175,7 @@ def pretrain_ppo_policy(demo_path, output_dir, epochs=100, batch_size=64,
 
     for epoch in range(epochs):
         # Training
-        policy.train()
+        policy.set_training_mode(True)
         train_losses = []
 
         for batch_obs, batch_act in train_loader:
@@ -142,11 +184,9 @@ def pretrain_ppo_policy(demo_path, output_dir, epochs=100, batch_size=64,
 
             optimizer.zero_grad()
 
-            # Get action from policy (deterministic)
-            # The policy outputs action mean from the actor network
-            features = policy.extract_features(batch_obs)
-            latent_pi, _ = policy.mlp_extractor(features)
-            pred_actions = policy.action_net(latent_pi)
+            # Use forward with deterministic=True to get action means
+            # forward returns (actions, values, log_prob)
+            pred_actions, _, _ = policy.forward(batch_obs, deterministic=True)
 
             # Compute loss
             loss = criterion(pred_actions, batch_act)
@@ -159,11 +199,9 @@ def pretrain_ppo_policy(demo_path, output_dir, epochs=100, batch_size=64,
         avg_train_loss = np.mean(train_losses)
 
         # Validation
-        policy.eval()
+        policy.set_training_mode(False)
         with torch.no_grad():
-            features = policy.extract_features(val_obs)
-            latent_pi, _ = policy.mlp_extractor(features)
-            pred_actions = policy.action_net(latent_pi)
+            pred_actions, _, _ = policy.forward(val_obs, deterministic=True)
             val_loss = criterion(pred_actions, val_act).item()
 
         # Print progress
