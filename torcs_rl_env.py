@@ -34,7 +34,7 @@ class TorcsRLEnv(gym.Env):
     metadata = {'render.modes': []}
 
     def __init__(self, port=3001, max_steps=15000, target_laps=1,
-                 off_track_threshold=1.5, start_min_distance=10,
+                 off_track_threshold=1.2, start_min_distance=10,
                  start_check_steps=500, reward_type='progress',
                  launch_assist=True):
         """
@@ -232,10 +232,10 @@ class TorcsRLEnv(gym.Env):
         current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
 
         # Steering damping at high speeds to prevent spins
-        # Reduce max steering as speed increases
-        if current_speed > 50:
-            # At 50 km/h: max steer = 1.0, at 150 km/h: max steer = 0.4, at 250 km/h: max steer = 0.2
-            max_steer = max(0.2, 1.0 - (current_speed - 50) / 150)
+        # Reduce max steering as speed increases, but allow enough for corners
+        if current_speed > 80:
+            # At 80 km/h: max steer = 1.0, at 200 km/h: max steer = 0.5, at 300 km/h: max steer = 0.35
+            max_steer = max(0.35, 1.0 - (current_speed - 80) / 240)
             steer = np.clip(steer, -max_steer, max_steer)
 
         # Launch assist: help the car accelerate so agent can focus on steering
@@ -489,50 +489,81 @@ class TorcsRLEnv(gym.Env):
             # 1. Progress reward (main driver)
             # Reward distance traveled - typically 0-5m per step at high speed
             dist_progress = dist_raced - self.prev_dist_raced
-            reward += dist_progress * 0.15  # Slightly reduced to balance with other rewards
+            reward += dist_progress * 1.0  # Reduced to balance with corner rewards
 
-            # 2. Speed bonus (encourage maintaining high speed, but not at all costs)
-            # Reduced scale to prevent "go fast and crash" strategy
+            # 2. Speed bonus (context-aware)
+            # Only reward speed when track ahead is clear
+            track_sensors = S.get('track', [100.0] * 19)
+            front_sensor = track_sensors[9] if len(track_sensors) > 9 else 100.0
+
+            # Scale speed bonus by how clear the track ahead is
+            clearance_factor = np.clip(front_sensor / 150.0, 0.2, 1.0)
             speed_normalized = np.clip(speed / 300.0, 0, 1)
-            reward += speed_normalized * 0.3
+            reward += speed_normalized * 0.2 * clearance_factor
 
-            # 3. Track position penalty (stay near center)
-            # Stronger penalty - starts earlier and scales faster
-            if track_pos > 0.2:
-                track_penalty = -(track_pos - 0.2) ** 2 * 1.5
+            # 3. Track position penalty - only penalize extreme positions
+            # Allow off-center driving for racing lines, penalize near-crash positions
+            if track_pos > 0.8:
+                track_penalty = -(track_pos - 0.8) ** 2 * 3.0
                 reward += track_penalty
 
-            # 4. Angle penalty (face forward)
-            angle_penalty = -angle * 0.15
+            # 4. Angle penalty (face forward) - scaled by speed
+            # More forgiving at low speeds where corrections are easier
+            speed_factor = np.clip(speed / 100.0, 0.3, 1.0)
+            angle_penalty = -angle * 0.1 * speed_factor
             reward += angle_penalty
 
-            # 5. Corner anticipation reward using track sensors
-            # Reward steering in the direction where the track continues
-            track_sensors = S.get('track', [100.0] * 19)
+            # 5. Corner anticipation and handling reward
             if len(track_sensors) >= 19:
                 # Track sensors: index 0 = far left (-90°), 9 = center (0°), 18 = far right (+90°)
-                # Look at sensors around center for upcoming turn detection
-                left_sensors = np.mean(track_sensors[2:6])   # ~-70° to -30°
-                right_sensors = np.mean(track_sensors[13:17])  # ~+30° to +70°
-                front_sensors = np.mean(track_sensors[7:12])   # ~-20° to +20°
+                left_far = np.mean(track_sensors[0:4])     # ~-90° to -50°
+                left_mid = np.mean(track_sensors[4:7])     # ~-50° to -20°
+                front = np.mean(track_sensors[7:12])       # ~-20° to +20°
+                right_mid = np.mean(track_sensors[12:15])  # ~+20° to +50°
+                right_far = np.mean(track_sensors[15:19])  # ~+50° to +90°
 
-                # If front is blocked but sides are open, we're approaching a corner
-                if front_sensors < 100:
-                    sensor_diff = right_sensors - left_sensors  # Positive = turn right
-                    current_steer = S.get('steer', 0) if S.get('steer') else 0
-                    # Get the actual steering from action (stored in client)
+                # Detect corner approach - front closing in
+                corner_approaching = front < 150
+
+                if corner_approaching:
+                    # Determine corner direction
+                    left_openness = left_far + left_mid * 0.7
+                    right_openness = right_far + right_mid * 0.7
+
+                    # Get actual steering being applied
                     actual_steer = self.client.R.d.get('steer', 0) if self.client.R.d else 0
+                    actual_brake = self.client.R.d.get('brake', 0) if self.client.R.d else 0
+                    actual_accel = self.client.R.d.get('accel', 0) if self.client.R.d else 0
 
-                    # Reward steering toward the open side
-                    if abs(sensor_diff) > 20:  # Significant difference
-                        desired_steer_dir = 1.0 if sensor_diff > 0 else -1.0
-                        steer_alignment = actual_steer * desired_steer_dir
-                        # Reward for steering correct direction, penalty for wrong
-                        corner_reward = steer_alignment * 0.3
-                        reward += corner_reward
+                    # Corner urgency based on how close the wall/edge is
+                    urgency = np.clip((150 - front) / 100.0, 0, 1.0)
 
-            # 6. Survival bonus - reward for staying on track
-            if speed > 10 and track_pos < 0.8:
+                    # Reward steering toward open side
+                    if abs(right_openness - left_openness) > 30:
+                        desired_steer = 1.0 if right_openness > left_openness else -1.0
+                        steer_alignment = actual_steer * desired_steer
+                        # Scale reward by urgency - more reward for correct steering when corner is close
+                        corner_steer_reward = steer_alignment * urgency * 1.5
+                        reward += corner_steer_reward
+
+                    # Reward braking when approaching corner at high speed
+                    if speed > 80 and front < 100:
+                        brake_reward = actual_brake * urgency * 1.0
+                        reward += brake_reward
+
+                        # Penalize full throttle into a corner
+                        if actual_accel > 0.8 and front < 80:
+                            reward -= 0.5 * urgency
+
+                    # Reward slowing down appropriately for tight corners
+                    if front < 60 and speed > 50:
+                        # Reward being at appropriate speed for corner tightness
+                        appropriate_speed = front * 1.5  # Rough heuristic: tighter corner = slower
+                        if speed < appropriate_speed + 30:
+                            reward += 0.3 * urgency
+
+            # 6. Survival bonus - reward for staying on track at speed
+            if speed > 10 and track_pos < 0.9:
                 reward += 0.1
 
             # 7. Lap completion bonus

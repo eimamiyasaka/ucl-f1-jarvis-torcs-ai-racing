@@ -124,7 +124,7 @@ def make_env(port=3001, max_steps=15000, reward_type='progress', monitor_dir=Non
             port=port,
             max_steps=max_steps,
             target_laps=1,
-            off_track_threshold=1.3,
+            off_track_threshold=1.2,
             start_min_distance=25,
             start_check_steps=250,
             reward_type=reward_type
