@@ -204,7 +204,7 @@ class TorcsRLEnv(gym.Env):
         # Give TORCS time to process the restart before reconnecting
         # This is crucial - without this delay, rapid episode resets can
         # overwhelm TORCS's restart mechanism
-        time.sleep(1.0)
+        time.sleep(5.0)
 
     def step(self, action):
         """
@@ -238,27 +238,25 @@ class TorcsRLEnv(gym.Env):
             max_steer = max(0.2, 1.0 - (current_speed - 50) / 150)
             steer = np.clip(steer, -max_steer, max_steer)
 
-        # Launch assist: push car to 150 km/h before giving full control to agent
+        # Launch assist: help the car accelerate so agent can focus on steering
         # Note: allow small negative speeds (car may report -0.0 at standstill)
-        if self.launch_assist_enabled and current_speed < 150 and current_speed >= -5:
-            # Progressive steering limit: heavily restricted during launch
-            # 0 km/h: 0.03, 50 km/h: 0.05, 100 km/h: 0.07, 150 km/h: 0.09
-            speed_factor = max(0, current_speed) / 150.0
-            launch_max_steer = 0.03 + speed_factor * 0.06
-            original_steer = steer
-            steer = np.clip(steer, -launch_max_steer, launch_max_steer)
-            # Reduce throttle when steering hard to prevent spins
-            # steer_factor: 1.0 at zero steer, 0.5 at max steer (0.35)
-            steer_factor = 1.0 - abs(steer) * 1.4  # ~50% reduction at max launch steering
-            target_accel = np.clip(steer_factor, 0.6, 1.0)  # Clamp between 60% and 100%
-            original_accel = accel
-            accel = target_accel  # Override agent throttle during launch
-            # previously used debug
-            # if self.step_count <= 5:
-            #     print(f"  [Launch] Step {self.step_count}: speed={current_speed:.1f}, "
-            #           f"max_steer={launch_max_steer:.2f}, steer {original_steer:.2f} -> {steer:.2f}, "
-            #           f"accel {original_accel:.2f} -> {accel:.2f}")
-            brake = 0.0  # No braking during launch
+        if self.launch_assist_enabled and current_speed >= -5:
+            # Phase 1: Steering restriction only at very low speeds (0-30 km/h)
+            if current_speed < 30:
+                speed_factor = max(0, current_speed) / 30.0
+                launch_max_steer = 0.1 + speed_factor * 0.4  # 0.1 at 0, 0.5 at 30 km/h
+                steer = np.clip(steer, -launch_max_steer, launch_max_steer)
+
+            # Phase 2: Minimum acceleration floor - ensures car keeps moving
+            # Reduce throttle when steering to prevent spins, but maintain minimum
+            if current_speed < 150:
+                steer_penalty = 1.0 - abs(steer) * 0.4
+                min_accel = np.clip(steer_penalty, 0.5, 1.0) * 0.8  # Min 40-80% throttle
+                accel = max(accel, min_accel)
+
+            # No braking until 100 km/h - let agent focus on steering first
+            if current_speed < 100:
+                brake = 0.0
 
         # If car is going backwards, don't accelerate (let it stop naturally)
         if current_speed < -5:
@@ -334,7 +332,7 @@ class TorcsRLEnv(gym.Env):
         if done:
             reason = dnf_reason if dnf_reason else "lap_complete"
             print(f"[Episode {self.episode_count}] Ended at step {self.step_count}: {reason} "
-                  f"(dist={S.get('distRaced', 0):.1f}m, reward={self.total_reward:.1f})")
+                  f"(dist={S.get('distRaced', 0):.1f}m, speed={S.get('speedX', 0):.1f}km/h, reward={self.total_reward:.1f})")
 
         # Add lap time info if lap completed
         if self.lap_tracker.lap_just_completed:
@@ -490,57 +488,73 @@ class TorcsRLEnv(gym.Env):
         if self.reward_type == 'progress':
             # 1. Progress reward (main driver)
             # Reward distance traveled - typically 0-5m per step at high speed
-            # Increased scale for better balance with terminal rewards
             dist_progress = dist_raced - self.prev_dist_raced
-            reward += dist_progress * 0.2
+            reward += dist_progress * 0.15  # Slightly reduced to balance with other rewards
 
-            # 2. Speed bonus (encourage maintaining high speed)
-            # Increased scale: 0 to 0.5 for speeds 0 to 300 km/h
+            # 2. Speed bonus (encourage maintaining high speed, but not at all costs)
+            # Reduced scale to prevent "go fast and crash" strategy
             speed_normalized = np.clip(speed / 300.0, 0, 1)
-            reward += speed_normalized * 0.5
+            reward += speed_normalized * 0.3
 
-            # 3. Track position penalty (stay near center, but allow some deviation)
-            # Softer penalty - only significant when far from center
-            # trackPos of 0.5 gives penalty of -0.125, trackPos of 1.0 gives -0.5
-            if track_pos > 0.3:
-                track_penalty = -(track_pos - 0.3) ** 2 * 0.5
+            # 3. Track position penalty (stay near center)
+            # Stronger penalty - starts earlier and scales faster
+            if track_pos > 0.2:
+                track_penalty = -(track_pos - 0.2) ** 2 * 1.5
                 reward += track_penalty
 
-            # 4. Angle penalty (face forward) - scaled down
-            # Angle in radians, typically < 0.5 for normal driving
-            angle_penalty = -angle * 0.1  # angle is already abs() from line 480
+            # 4. Angle penalty (face forward)
+            angle_penalty = -angle * 0.15
             reward += angle_penalty
 
-            # 5. Survival bonus - small reward for staying on track and moving
-            # Encourages conservative driving early in training
-            if speed > 10 and track_pos < 1.0:
-                reward += 0.05
+            # 5. Corner anticipation reward using track sensors
+            # Reward steering in the direction where the track continues
+            track_sensors = S.get('track', [100.0] * 19)
+            if len(track_sensors) >= 19:
+                # Track sensors: index 0 = far left (-90°), 9 = center (0°), 18 = far right (+90°)
+                # Look at sensors around center for upcoming turn detection
+                left_sensors = np.mean(track_sensors[2:6])   # ~-70° to -30°
+                right_sensors = np.mean(track_sensors[13:17])  # ~+30° to +70°
+                front_sensors = np.mean(track_sensors[7:12])   # ~-20° to +20°
 
-            # 6. Lap completion bonus
-            # Primary reward signal - completing a lap is the main goal
-            # Base bonus for completion + time-scaled bonus for faster laps
+                # If front is blocked but sides are open, we're approaching a corner
+                if front_sensors < 100:
+                    sensor_diff = right_sensors - left_sensors  # Positive = turn right
+                    current_steer = S.get('steer', 0) if S.get('steer') else 0
+                    # Get the actual steering from action (stored in client)
+                    actual_steer = self.client.R.d.get('steer', 0) if self.client.R.d else 0
+
+                    # Reward steering toward the open side
+                    if abs(sensor_diff) > 20:  # Significant difference
+                        desired_steer_dir = 1.0 if sensor_diff > 0 else -1.0
+                        steer_alignment = actual_steer * desired_steer_dir
+                        # Reward for steering correct direction, penalty for wrong
+                        corner_reward = steer_alignment * 0.3
+                        reward += corner_reward
+
+            # 6. Survival bonus - reward for staying on track
+            if speed > 10 and track_pos < 0.8:
+                reward += 0.1
+
+            # 7. Lap completion bonus
             if self.lap_tracker.lap_just_completed:
                 lap_time = self.lap_tracker.last_lap_time
-                # Base bonus: 750 points just for finishing
-                # Time bonus: 750 * (60/lap_time) - rewards faster completion
-                base_bonus = 750.0
-                time_bonus = 750.0 * (60.0 / max(lap_time, 30.0))
+                base_bonus = 1000.0
+                time_bonus = 1000.0 * (60.0 / max(lap_time, 30.0))
                 lap_bonus = base_bonus + time_bonus
                 reward += lap_bonus
 
-            # 7. DNF penalty - scaled to be comparable to missing a lap bonus
+            # 8. DNF penalty - MUCH stronger to discourage crashing
             if done and dnf_reason is not None:
-                # Penalty based on progress made - less penalty if close to finishing
-                progress_fraction = min(dist_raced / 3610.0, 1.0)  # Corkscrew track is 3.608km
+                progress_fraction = min(dist_raced / 3610.0, 1.0)
                 if dnf_reason == 'off_track':
-                    reward -= 20.0 * (1.0 - 0.5 * progress_fraction)
+                    # Strong penalty: -100 at start, -50 near finish
+                    reward -= 100.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'facing_backward':
-                    reward -= 20.0 * (1.0 - 0.5 * progress_fraction)
+                    reward -= 100.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'stalled_start':
-                    reward -= 30.0  # Penalty for not even starting
+                    reward -= 50.0
                 elif dnf_reason == 'max_steps':
-                    # Mild penalty - agent was trying but too slow
-                    reward -= 5.0
+                    reward -= 10.0
 
         elif self.reward_type == 'time':
             # Alternative: sparse reward based on lap time
