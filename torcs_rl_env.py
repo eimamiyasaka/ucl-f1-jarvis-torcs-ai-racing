@@ -107,6 +107,7 @@ class TorcsRLEnv(gym.Env):
         self.consecutive_failures = 0  # Track consecutive communication failures
         self.max_consecutive_failures = 5  # Max failures before episode termination
         self.launch_assist_complete = False  # Track if launch assist phase is done
+        self.stalled_steps = 0  # Track consecutive steps with near-zero speed
 
     def reset(self, seed=None, options=None):
         """Reset the environment and return initial observation and info."""
@@ -165,6 +166,7 @@ class TorcsRLEnv(gym.Env):
         self.start_check_done = False
         self.total_reward = 0.0
         self.launch_assist_complete = False  # Reset launch assist for new episode
+        self.stalled_steps = 0  # Reset stalled counter
 
         # Debug: show initial state
         if self.client.S.d:
@@ -228,40 +230,42 @@ class TorcsRLEnv(gym.Env):
         accel = np.clip(action[1], 0.0, 1.0)
         brake = np.clip(action[2], 0.0, 1.0)
 
-        # # Get current state
-        # current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
+        # Get current state
+        current_speed = self.client.S.d.get('speedX', 0) if self.client.S.d else 0
 
-        # # Steering damping at high speeds to prevent spins
-        # # Reduce max steering as speed increases, but allow enough for corners
-        # if current_speed > 80:
-        #     # At 80 km/h: max steer = 1.0, at 200 km/h: max steer = 0.5, at 300 km/h: max steer = 0.35
-        #     max_steer = max(0.35, 1.0 - (current_speed - 80) / 240)
-        #     steer = np.clip(steer, -max_steer, max_steer)
+        # Steering damping at high speeds to prevent spins
+        # Reduce max steering as speed increases, but allow enough for corners
+        if current_speed > 80:
+            # At 80 km/h: max steer = 1.0, at 200 km/h: max steer = 0.5, at 300 km/h: max steer = 0.35
+            max_steer = max(0.35, 1.0 - (current_speed - 80) / 240)
+            steer = np.clip(steer, -max_steer, max_steer)
 
-        # # Launch assist: help the car accelerate so agent can focus on steering
-        # # Note: allow small negative speeds (car may report -0.0 at standstill)
-        # if self.launch_assist_enabled and current_speed >= -5:
-        #     # Phase 1: Steering restriction only at very low speeds (0-30 km/h)
-        #     if current_speed < 30:
-        #         speed_factor = max(0, current_speed) / 30.0
-        #         launch_max_steer = 0.1 + speed_factor * 0.4  # 0.1 at 0, 0.5 at 30 km/h
-        #         steer = np.clip(steer, -launch_max_steer, launch_max_steer)
+        # Launch assist: help the car accelerate at the START of the lap only
+        # Once car reaches 100 km/h, launch assist is complete and agent has full control
+        if self.launch_assist_enabled and not self.launch_assist_complete:
+            if current_speed >= 100:
+                # Launch phase complete - agent now has full control
+                self.launch_assist_complete = True
+            elif current_speed >= -5:
+                # Still in launch phase - apply assists
+                # Phase 1: Steering restriction at very low speeds (0-30 km/h)
+                if current_speed < 30:
+                    speed_factor = max(0, current_speed) / 30.0
+                    launch_max_steer = 0.1 + speed_factor * 0.4  # 0.1 at 0, 0.5 at 30 km/h
+                    steer = np.clip(steer, -launch_max_steer, launch_max_steer)
 
-        #     # Phase 2: Minimum acceleration floor - ensures car keeps moving
-        #     # Reduce throttle when steering to prevent spins, but maintain minimum
-        #     if current_speed < 150:
-        #         steer_penalty = 1.0 - abs(steer) * 0.4
-        #         min_accel = np.clip(steer_penalty, 0.5, 1.0) * 0.8  # Min 40-80% throttle
-        #         accel = max(accel, min_accel)
+                # Phase 2: Minimum acceleration floor - ensures car keeps moving
+                steer_penalty = 1.0 - abs(steer) * 0.4
+                min_accel = np.clip(steer_penalty, 0.5, 1.0) * 0.8  # Min 40-80% throttle
+                accel = max(accel, min_accel)
 
-        #     # No braking until 100 km/h - let agent focus on steering first
-        #     if current_speed < 100:
-        #         brake = 0.0
+                # No braking during launch
+                brake = 0.0
 
-        # # If car is going backwards, don't accelerate (let it stop naturally)
-        # if current_speed < -5:
-        #     accel = 0.0
-        #     brake = 0.5  # Apply some brake to stop
+        # If car is going backwards, don't accelerate (let it stop naturally)
+        if current_speed < -5:
+            accel = 0.0
+            brake = 0.5  # Apply some brake to stop
 
         self.client.R.d['steer'] = steer
         self.client.R.d['accel'] = accel
@@ -269,6 +273,13 @@ class TorcsRLEnv(gym.Env):
 
         # Simple automatic gear shifting
         self.client.R.d['gear'] = self._auto_gear()
+
+        # Debug: print actions every 50 steps
+        if self.step_count % 50 == 1:
+            launch_active = self.launch_assist_enabled and not self.launch_assist_complete
+            print(f"  [Step {self.step_count}] Actions: accel={accel:.2f}, brake={brake:.2f}, "
+                  f"steer={steer:.2f}, gear={self.client.R.d['gear']}, "
+                  f"Launch Assist active: {launch_active}")
 
         # Send action and get response with failure tracking
         send_success = self.client.respond_to_server()
@@ -288,6 +299,12 @@ class TorcsRLEnv(gym.Env):
                 return obs, -100.0, True, False, {'dnf': True, 'dnf_reason': 'connection_timeout'}
         else:
             self.consecutive_failures = 0  # Reset on success
+
+        # # Debug: print state every 50 steps
+        # if self.step_count % 50 == 1 and self.client.S.d:
+        #     S = self.client.S.d
+        #     print(f"  [Step {self.step_count}] State: speed={S.get('speedX', 0):.1f}, "
+        #           f"dist={S.get('distRaced', 0):.1f}, gear={S.get('gear', 0)}")
 
         # Check if connection closed
         if self.client.so is None or self.client.S.d is None:
@@ -451,6 +468,14 @@ class TorcsRLEnv(gym.Env):
         if math.cos(angle) < 0 and speed > 5:  # Only if actually moving backward
             return True, 'facing_backward'
 
+        # Stalled mid-race - car stopped moving for too long
+        if abs(speed) < 5:
+            self.stalled_steps += 1
+            if self.stalled_steps >= 100:  # ~2 seconds at 50 FPS
+                return True, 'stalled'
+        else:
+            self.stalled_steps = 0  # Reset if moving again
+
         # Stalled at start - be more lenient
         if not self.start_check_done and self.step_count >= self.start_check_steps:
             dist_raced = S.get('distRaced', 0)
@@ -562,9 +587,9 @@ class TorcsRLEnv(gym.Env):
                         if speed < appropriate_speed + 30:
                             reward += 0.3 * urgency
 
-            # 6. Survival bonus - reward for staying on track at speed
-            if speed > 10 and track_pos < 0.9:
-                reward += 0.1
+            # 6. Low speed penalty - discourage stalling/crawling
+            if speed < 30:
+                reward -= 0.5 * (1.0 - speed / 30.0)  # -0.5 at 0 km/h, 0 at 30 km/h
 
             # 7. Lap completion bonus
             if self.lap_tracker.lap_just_completed:
@@ -584,6 +609,8 @@ class TorcsRLEnv(gym.Env):
                     reward -= 100.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'stalled_start':
                     reward -= 50.0
+                elif dnf_reason == 'stalled':
+                    reward -= 100.0 * (1.0 - 0.5 * progress_fraction)
                 elif dnf_reason == 'max_steps':
                     reward -= 10.0
 
