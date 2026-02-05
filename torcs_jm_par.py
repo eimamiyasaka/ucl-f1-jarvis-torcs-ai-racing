@@ -572,32 +572,56 @@ CORNER_STRENGTH_THRESHOLD = 0.1  # Only pre-steer when corner strength exceeds t
 STEER_SMOOTH_ALPHA = 0.15  # Low-pass filter coefficient (0.05-0.3, lower = smoother)
 STEER_RATE_LIMIT = 0.05  # Max steering change per step (0.02-0.1)
 BIAS_SMOOTH_ALPHA = 0.05  # Low-pass filter for bias to prevent sudden flips (0.02-0.1)
+CORNER_STRENGTH_DECAY = 0.03  # How fast corner_strength can DROP (0.02-0.1, lower = slower exit)
 
 # ================= STEERING STATE (for smoothing) =================
 _prev_steer = 0.0
 _prev_bias = 0.0
+_prev_corner_strength = 0.0
 
 
 def reset_steering_state():
     """Reset steering state between episodes. Call this at the start of each run."""
-    global _prev_steer, _prev_bias
+    global _prev_steer, _prev_bias, _prev_corner_strength
     _prev_steer = 0.0
     _prev_bias = 0.0
+    _prev_corner_strength = 0.0
 
 # ================= HELPER FUNCTIONS =================
 
-def get_corner_strength(track):
+def get_corner_strength(track, apply_smoothing=True):
     """
     Calculate how imminent a corner is based on forward LIDAR sensor.
+
+    Uses asymmetric smoothing: rises quickly (to brake for corners)
+    but falls slowly (to not accelerate out of chicanes too early).
 
     Returns:
         float: 0.0 = straight ahead, 1.0 = corner imminent
     """
+    global _prev_corner_strength
+
     forward_dist = track[9]  # Center forward sensor
     if forward_dist >= LOOKAHEAD_DISTANCE:
-        return 0.0
-    strength = (LOOKAHEAD_DISTANCE - forward_dist) / LOOKAHEAD_DISTANCE
-    return max(0.0, min(1.0, strength))
+        raw_strength = 0.0
+    else:
+        raw_strength = (LOOKAHEAD_DISTANCE - forward_dist) / LOOKAHEAD_DISTANCE
+    raw_strength = max(0.0, min(1.0, raw_strength))
+
+    if not apply_smoothing:
+        return raw_strength
+
+    # Asymmetric smoothing: fast rise, slow decay
+    if raw_strength > _prev_corner_strength:
+        # Corner approaching - respond immediately
+        smoothed = raw_strength
+    else:
+        # Corner receding - decay slowly to handle chicanes
+        smoothed = _prev_corner_strength - CORNER_STRENGTH_DECAY
+        smoothed = max(raw_strength, smoothed)  # Don't go below actual value
+
+    _prev_corner_strength = smoothed
+    return smoothed
 
 
 def get_lidar_bias(track, apply_smoothing=True):
@@ -887,10 +911,10 @@ def log_state(step, S, R):
     """Log car state for debugging. Call every N steps."""
     track = S.get('track', None)
 
-    # Calculate LIDAR values (use raw bias for logging to see actual sensor values)
+    # Calculate LIDAR values (use raw values for logging to see actual sensor readings)
     if track is not None and len(track) >= 19:
         forward = track[9]
-        corner_str = get_corner_strength(track)
+        corner_str = get_corner_strength(track, apply_smoothing=False)  # Raw value for debugging
         bias = get_lidar_bias(track, apply_smoothing=False)  # Raw value for debugging
     else:
         forward = -1
@@ -923,7 +947,7 @@ if __name__ == "__main__":
     print("-" * 50)
 
     step_count = 0
-    LOG_INTERVAL = 50  # Log every N steps
+    LOG_INTERVAL = 25  # Log every N steps
 
     for step in range(C.maxSteps, 0, -1):
         C.get_servers_input()
