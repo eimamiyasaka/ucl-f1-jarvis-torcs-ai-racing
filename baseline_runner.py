@@ -13,7 +13,7 @@ from datetime import datetime
 from torcs_jm_par import (
     Client, LapTimeTracker,
     calculate_steering, calculate_throttle, apply_brakes,
-    shift_gears, traction_control
+    shift_gears, traction_control, reset_steering_state
 )
 import torcs_jm_par as torcs_module
 
@@ -118,6 +118,18 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
     # Traction control parameters
     torcs_module.TC_THRESHOLD = params.get('TC_THRESHOLD', 2)
     torcs_module.TC_REDUCTION = params.get('TC_REDUCTION', 0.1)
+
+    # LIDAR anticipation parameters (HIGH IMPACT)
+    torcs_module.LOOKAHEAD_DISTANCE = params.get('LOOKAHEAD_DISTANCE', 80.0)
+    torcs_module.CORNER_LOOKAHEAD_GAIN = params.get('CORNER_LOOKAHEAD_GAIN', 0.25)
+    torcs_module.CORNER_STRENGTH_THRESHOLD = params.get('CORNER_STRENGTH_THRESHOLD', 0.4)
+
+    # Steering smoothing parameters (HIGH IMPACT)
+    torcs_module.STEER_SMOOTH_ALPHA = params.get('STEER_SMOOTH_ALPHA', 0.15)
+    torcs_module.STEER_RATE_LIMIT = params.get('STEER_RATE_LIMIT', 0.05)
+
+    # Reset steering state for new episode (important for smoothing)
+    reset_steering_state()
 
     if verbose:
         print(f"Running episode with params:")
@@ -236,7 +248,7 @@ def run_episode(params, port=3001, max_steps=100000, target_laps=1, verbose=True
 
 
 def get_default_params():
-    """Return default parameter dictionary with all 15 tunable parameters."""
+    """Return default parameter dictionary with all tunable parameters."""
     # Gear speeds derived from previous best GEAR_SHIFT_SCALE of ~0.61
     gear_scale = 0.6108308839970421
     return {
@@ -257,6 +269,13 @@ def get_default_params():
         # Traction control parameters (2)
         'TC_THRESHOLD': 2.0,
         'TC_REDUCTION': 0.1,
+        # LIDAR anticipation parameters (2) - HIGH IMPACT
+        'LOOKAHEAD_DISTANCE': 80.0,  # Distance to start anticipating corners (40-150)
+        'CORNER_LOOKAHEAD_GAIN': 0.25,  # Pre-steering strength (0.1-0.5)
+        'CORNER_STRENGTH_THRESHOLD': 0.4,  # Only pre-steer above this (0.2-0.6)
+        # Steering smoothing parameters (2) - HIGH IMPACT
+        'STEER_SMOOTH_ALPHA': 0.15,  # Low-pass filter (0.05-0.3, lower=smoother)
+        'STEER_RATE_LIMIT': 0.05,  # Max steering change per step (0.02-0.1)
         # Fixed parameter
         'ENABLE_TRACTION_CONTROL': True
     }

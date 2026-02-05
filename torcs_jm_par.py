@@ -138,7 +138,7 @@ class Client():
                             os.chdir(torcs_dir)
                             os.startfile('wtorcs.exe')
                             os.chdir(original_dir)  # Restore original directory
-                            time.sleep(2.0)  # Wait for TORCS to load
+                            time.sleep(10.0)  # Wait for TORCS to load
                             print("Please start a Quick Race manually in TORCS.")
                         else:
                             print("Could not find wtorcs.exe at: %s" % torcs_exe)
@@ -154,7 +154,7 @@ class Client():
                         if os.path.exists('autostart.sh'):
                             os.system('sh autostart.sh')
 
-                    time.sleep(3.0)  # Give TORCS time to start
+                    time.sleep(10.0)  # Give TORCS time to start
                     n_fail = 5
                 n_fail -= 1
 
@@ -544,7 +544,7 @@ import math
 
 # ================= USER CONFIGURABLE PARAMETERS =================
 # Core driving parameters
-TARGET_SPEED = 70  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
+TARGET_SPEED = 80  # Target speed in km/h. Increasing this makes the car go faster but may reduce stability.
 STEER_GAIN = 18     # Steering sensitivity. Higher values make the car turn more aggressively.
 CENTERING_GAIN = 0.60  # How strongly the car corrects its position toward the center of the track.
 BRAKE_THRESHOLD = 0.2  # Angle threshold for braking. Lower values brake earlier.
@@ -563,22 +563,174 @@ BRAKE_INTENSITY = 0.3  # Braking force when threshold exceeded (0.1-0.8)
 TC_THRESHOLD = 2  # Wheel spin differential to trigger TC (1-10)
 TC_REDUCTION = 0.1  # Throttle reduction when TC activates (0.05-0.3)
 
+# ================= LIDAR ANTICIPATION PARAMETERS (HIGH IMPACT) =================
+LOOKAHEAD_DISTANCE = 80.0  # Distance threshold to start anticipating corners (40-150)
+CORNER_LOOKAHEAD_GAIN = 0.5  # Pre-steering strength toward open space (0.3-1.0)
+CORNER_STRENGTH_THRESHOLD = 0.1  # Only pre-steer when corner strength exceeds this (0.05-0.3)
+
+# ================= STEERING SMOOTHING PARAMETERS (HIGH IMPACT) =================
+STEER_SMOOTH_ALPHA = 0.1  # Low-pass filter coefficient (0.05-0.3, lower = smoother)
+STEER_RATE_LIMIT = 0.05  # Max steering change per step (0.02-0.1)
+
+# ================= STEERING STATE (for smoothing) =================
+_prev_steer = 0.0
+
+
+def reset_steering_state():
+    """Reset steering state between episodes. Call this at the start of each run."""
+    global _prev_steer
+    _prev_steer = 0.0
+
 # ================= HELPER FUNCTIONS =================
+
+def get_corner_strength(track):
+    """
+    Calculate how imminent a corner is based on forward LIDAR sensor.
+
+    Returns:
+        float: 0.0 = straight ahead, 1.0 = corner imminent
+    """
+    forward_dist = track[9]  # Center forward sensor
+    if forward_dist >= LOOKAHEAD_DISTANCE:
+        return 0.0
+    strength = (LOOKAHEAD_DISTANCE - forward_dist) / LOOKAHEAD_DISTANCE
+    return max(0.0, min(1.0, strength))
+
+
+def get_lidar_bias(track):
+    """
+    Calculate which side has more space using LIDAR sensors.
+
+    Returns:
+        float: -1 to 1 (positive = more space on right, steer right)
+    """
+    # track[0:9] = left side sensors (-45 to -0.5 degrees)
+    # track[9] = center forward
+    # track[10:19] = right side sensors (0.5 to 45 degrees)
+    left_avg = sum(track[0:9]) / 9.0
+    right_avg = sum(track[10:19]) / 9.0
+
+    # Normalized difference: positive means more space on right
+    denom = left_avg + right_avg + 1e-6  # Avoid division by zero
+    bias = (right_avg - left_avg) / denom
+
+    return max(-1.0, min(1.0, bias))
+
+
+def smooth_steering(desired_steer):
+    """
+    Apply low-pass filter and rate limiting to steering for smoother control.
+
+    Args:
+        desired_steer: The raw calculated steering value
+
+    Returns:
+        float: Smoothed steering value
+    """
+    global _prev_steer
+
+    # Low-pass filter: gradual transition toward desired value
+    filtered = _prev_steer + STEER_SMOOTH_ALPHA * (desired_steer - _prev_steer)
+
+    # Rate limiting: cap the maximum change per step
+    delta = filtered - _prev_steer
+    delta = max(-STEER_RATE_LIMIT, min(STEER_RATE_LIMIT, delta))
+
+    new_steer = _prev_steer + delta
+    new_steer = max(-1.0, min(1.0, new_steer))
+
+    _prev_steer = new_steer
+    return new_steer
+
+
 def calculate_steering(S):
-    steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
-    return max(-1, min(1, steer))
+    """
+    Calculate steering with LIDAR anticipation and smoothing.
+
+    Features:
+    1. Base steering from angle and track position
+    2. Pre-steering toward open space when corner detected
+    3. Smoothing to prevent jittery inputs
+    """
+    # Base steering: angle correction + centering
+    raw_steer = (S['angle'] * STEER_GAIN / math.pi) - (S['trackPos'] * CENTERING_GAIN)
+
+    # LIDAR-based pre-steering (HIGH IMPACT FEATURE)
+    # Activates when any corner is detected, scaled by corner_strength directly
+    track = S.get('track', None)
+    if track is not None and len(track) >= 19:
+        corner_strength = get_corner_strength(track)
+
+        # Pre-steer when any corner is detected (low threshold for smooth transition)
+        if corner_strength > CORNER_STRENGTH_THRESHOLD:
+            # Get bias toward side with more space
+            bias = get_lidar_bias(track)
+            # Add pre-steering proportional to corner proximity (direct scaling, no hard cutoff)
+            raw_steer += bias * CORNER_LOOKAHEAD_GAIN * corner_strength
+
+    # Clip before smoothing
+    raw_steer = max(-1.0, min(1.0, raw_steer))
+
+    # Apply smoothing (HIGH IMPACT FEATURE)
+    smoothed_steer = smooth_steering(raw_steer)
+
+    return smoothed_steer
 
 def calculate_throttle(S, R):
-    if S['speedX'] < TARGET_SPEED - (R['steer'] * SPEED_STEER_FACTOR):
+    """
+    Calculate throttle with LIDAR-based speed adaptation.
+
+    Uses corner strength to gradually reduce target speed as corners approach,
+    rather than relying solely on reactive braking.
+    """
+    # Calculate effective target speed based on corner proximity
+    effective_target = TARGET_SPEED
+
+    track = S.get('track', None)
+    if track is not None and len(track) >= 19:
+        corner_strength = get_corner_strength(track)
+        # Reduce target speed as corner approaches (down to 50% at max corner strength)
+        effective_target = TARGET_SPEED * (1.0 - 0.5 * corner_strength)
+
+    # Adjust target based on steering (existing logic)
+    adjusted_target = effective_target - (abs(R['steer']) * SPEED_STEER_FACTOR)
+
+    if S['speedX'] < adjusted_target:
         accel = min(1.0, R['accel'] + THROTTLE_INCREASE)
     else:
         accel = max(0.0, R['accel'] - THROTTLE_DECREASE)
+
+    # Launch assist at low speed
     if S['speedX'] < 10:
         accel += 1 / (S['speedX'] + 0.1)
+
     return max(0.0, min(1.0, accel))
 
 def apply_brakes(S):
-    return BRAKE_INTENSITY if abs(S['angle']) > BRAKE_THRESHOLD else 0.0
+    """
+    Apply brakes with LIDAR anticipation.
+
+    Brakes when:
+    1. Car angle exceeds threshold (reactive)
+    2. Corner approaching AND speed is too high (anticipatory)
+    """
+    brake = 0.0
+
+    # Reactive braking: angle exceeds threshold
+    if abs(S['angle']) > BRAKE_THRESHOLD:
+        brake = BRAKE_INTENSITY
+
+    # Anticipatory braking: corner approaching fast
+    track = S.get('track', None)
+    if track is not None and len(track) >= 19:
+        corner_strength = get_corner_strength(track)
+        effective_target = TARGET_SPEED * (1.0 - 0.5 * corner_strength)
+
+        # Brake if significantly over effective target speed
+        if S['speedX'] > effective_target + 10 and corner_strength > 0.3:
+            brake = max(brake, BRAKE_INTENSITY * corner_strength)
+
+    return min(1.0, brake)
 
 def shift_gears(S):
     gear = 1
@@ -715,6 +867,26 @@ class LapTimeTracker:
         self._step_count = 0
 
 
+# ================= DEBUG LOGGING =================
+def log_state(step, S, R):
+    """Log car state for debugging. Call every N steps."""
+    track = S.get('track', None)
+
+    # Calculate LIDAR values
+    if track is not None and len(track) >= 19:
+        forward = track[9]
+        corner_str = get_corner_strength(track)
+        bias = get_lidar_bias(track)
+    else:
+        forward = -1
+        corner_str = 0
+        bias = 0
+
+    print(f"[{step:5d}] spd:{S['speedX']:5.1f} ang:{S['angle']:+.3f} trkPos:{S['trackPos']:+.2f} | "
+          f"fwd:{forward:5.1f} corner:{corner_str:.2f} bias:{bias:+.2f} | "
+          f"steer:{R['steer']:+.3f} accel:{R['accel']:.2f} brake:{R['brake']:.2f}")
+
+
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
     S, R = c.S.d, c.R.d
@@ -732,11 +904,21 @@ if __name__ == "__main__":
 
     print("Starting simulation with lap time tracking...")
     print("-" * 50)
+    print("LOG: [step] spd:speed ang:angle trkPos:trackPos | fwd:forward corner:strength bias:bias | steer accel brake")
+    print("-" * 50)
+
+    step_count = 0
+    LOG_INTERVAL = 50  # Log every N steps
 
     for step in range(C.maxSteps, 0, -1):
         C.get_servers_input()
         if C.S.d:  # Only process if we have valid server state
             drive_modular(C)
+            step_count += 1
+
+            # Log every N steps
+            if step_count % LOG_INTERVAL == 0:
+                log_state(step_count, C.S.d, C.R.d)
 
             # Update lap tracker
             lap_tracker.update(C.S.d)

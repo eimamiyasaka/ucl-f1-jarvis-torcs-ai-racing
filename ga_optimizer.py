@@ -105,8 +105,15 @@ def chromosome_to_params(chromosome):
         # Traction control (2)
         'TC_THRESHOLD': chromosome[13],
         'TC_REDUCTION': chromosome[14],
-        # Fixed parameter
-        'ENABLE_TRACTION_CONTROL': True
+        # Fixed parameters
+        'ENABLE_TRACTION_CONTROL': True,
+        # LIDAR anticipation - fixed sensible defaults (not in GA to reduce search space)
+        'LOOKAHEAD_DISTANCE': 80.0,
+        'CORNER_LOOKAHEAD_GAIN': 0.25,
+        'CORNER_STRENGTH_THRESHOLD': 0.4,
+        # Steering smoothing - fixed sensible defaults
+        'STEER_SMOOTH_ALPHA': 0.15,
+        'STEER_RATE_LIMIT': 0.05,
     }
 
 
