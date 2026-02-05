@@ -569,17 +569,20 @@ CORNER_LOOKAHEAD_GAIN = 0.5  # Pre-steering strength toward open space (0.3-1.0)
 CORNER_STRENGTH_THRESHOLD = 0.1  # Only pre-steer when corner strength exceeds this (0.05-0.3)
 
 # ================= STEERING SMOOTHING PARAMETERS (HIGH IMPACT) =================
-STEER_SMOOTH_ALPHA = 0.1  # Low-pass filter coefficient (0.05-0.3, lower = smoother)
+STEER_SMOOTH_ALPHA = 0.15  # Low-pass filter coefficient (0.05-0.3, lower = smoother)
 STEER_RATE_LIMIT = 0.05  # Max steering change per step (0.02-0.1)
+BIAS_SMOOTH_ALPHA = 0.05  # Low-pass filter for bias to prevent sudden flips (0.02-0.1)
 
 # ================= STEERING STATE (for smoothing) =================
 _prev_steer = 0.0
+_prev_bias = 0.0
 
 
 def reset_steering_state():
     """Reset steering state between episodes. Call this at the start of each run."""
-    global _prev_steer
+    global _prev_steer, _prev_bias
     _prev_steer = 0.0
+    _prev_bias = 0.0
 
 # ================= HELPER FUNCTIONS =================
 
@@ -597,13 +600,18 @@ def get_corner_strength(track):
     return max(0.0, min(1.0, strength))
 
 
-def get_lidar_bias(track):
+def get_lidar_bias(track, apply_smoothing=True):
     """
     Calculate which side has more space using LIDAR sensors.
+
+    Applies smoothing to prevent sudden bias flips when transitioning
+    between corners (e.g., right bend into left bend).
 
     Returns:
         float: -1 to 1 (positive = more space on right, steer right)
     """
+    global _prev_bias
+
     # track[0:9] = left side sensors (-45 to -0.5 degrees)
     # track[9] = center forward
     # track[10:19] = right side sensors (0.5 to 45 degrees)
@@ -612,9 +620,16 @@ def get_lidar_bias(track):
 
     # Normalized difference: positive means more space on right
     denom = left_avg + right_avg + 1e-6  # Avoid division by zero
-    bias = (right_avg - left_avg) / denom
+    raw_bias = (right_avg - left_avg) / denom
+    raw_bias = max(-1.0, min(1.0, raw_bias))
 
-    return max(-1.0, min(1.0, bias))
+    if apply_smoothing:
+        # Low-pass filter: gradual transition to new bias value
+        smoothed_bias = _prev_bias + BIAS_SMOOTH_ALPHA * (raw_bias - _prev_bias)
+        _prev_bias = smoothed_bias
+        return smoothed_bias
+    else:
+        return raw_bias
 
 
 def smooth_steering(desired_steer):
@@ -872,11 +887,11 @@ def log_state(step, S, R):
     """Log car state for debugging. Call every N steps."""
     track = S.get('track', None)
 
-    # Calculate LIDAR values
+    # Calculate LIDAR values (use raw bias for logging to see actual sensor values)
     if track is not None and len(track) >= 19:
         forward = track[9]
         corner_str = get_corner_strength(track)
-        bias = get_lidar_bias(track)
+        bias = get_lidar_bias(track, apply_smoothing=False)  # Raw value for debugging
     else:
         forward = -1
         corner_str = 0
